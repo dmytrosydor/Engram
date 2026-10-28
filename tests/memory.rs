@@ -77,6 +77,7 @@ fn search(
             scope,
             kind: None,
             limit: 8,
+            as_of: None,
         },
     )
     .unwrap()
@@ -296,6 +297,7 @@ fn get_counts_hits_and_marks_recall_open() {
             scope: Scope::Project,
             kind: None,
             limit: 8,
+            as_of: None,
         },
     )
     .unwrap();

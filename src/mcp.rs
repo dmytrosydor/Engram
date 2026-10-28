@@ -127,6 +127,7 @@ impl Server {
                 scope: Scope::parse(a.scope.as_deref())?,
                 kind: a.kind.as_deref(),
                 limit: a.limit.unwrap_or(8).clamp(1, 50),
+                as_of: None,
             },
         )?;
         memory::log_recall(&conn, &self.session, &self.space, &a.q, &hits)?;

@@ -4,6 +4,7 @@ pub mod core;
 pub mod daily;
 pub mod db;
 pub mod embed;
+pub mod eval;
 pub mod hook;
 pub mod import;
 pub mod index;

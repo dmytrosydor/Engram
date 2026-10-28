@@ -3,7 +3,7 @@ use std::process::ExitCode;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use engram::{core, daily, db, embed, import, index, memory, review, spaces};
+use engram::{core, daily, db, embed, eval, import, index, memory, review, spaces};
 
 #[derive(Parser)]
 #[command(
@@ -83,9 +83,32 @@ enum Cmd {
     /// The review queue
     #[command(subcommand)]
     Review(ReviewCmd),
+    /// Search quality on (query -> opened record) pairs from past sessions
+    #[command(subcommand)]
+    Eval(EvalCmd),
     /// Claude Code hook entry points (read the hook JSON on stdin)
     #[command(subcommand)]
     Hook(HookCmd),
+}
+
+#[derive(Subcommand)]
+enum EvalCmd {
+    /// Collect pairs from transcripts into a JSONL file
+    Extract {
+        #[arg(long, default_value = "~/.engram/eval/pairs.jsonl")]
+        out: String,
+    },
+    /// Hit@5 and MRR per space, latency, and a domain-isolation check
+    Run {
+        #[arg(long, default_value = "~/.engram/eval/pairs.jsonl")]
+        pairs: String,
+        /// Write per-pair outcomes here as JSON
+        #[arg(long)]
+        rows: Option<PathBuf>,
+        /// A personal folder and a work folder for the isolation check
+        #[arg(long, num_args = 2, value_names = ["PERSONAL", "WORK"])]
+        isolation: Option<Vec<PathBuf>>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -197,6 +220,7 @@ fn main() -> Result<ExitCode> {
                     scope: memory::Scope::parse(scope.as_deref())?,
                     kind: kind.as_deref(),
                     limit,
+                    as_of: None,
                 },
             )?;
             for h in &hits {
@@ -280,6 +304,50 @@ fn main() -> Result<ExitCode> {
             };
             let id = daily::add_note(&conn, &space, &text, "note:cli")?;
             println!("inbox #{id} ({space}); processed by the next daily pass");
+            Ok(ExitCode::SUCCESS)
+        }
+        Cmd::Eval(EvalCmd::Extract { out }) => {
+            let out = PathBuf::from(spaces::expand_home(&out));
+            if let Some(dir) = out.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            let projects = PathBuf::from(spaces::expand_home("~/.claude/projects"));
+            println!(
+                "{} pairs -> {}",
+                eval::extract(&projects, &out)?,
+                out.display()
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        Cmd::Eval(EvalCmd::Run {
+            pairs,
+            rows,
+            isolation,
+        }) => {
+            let conn = open()?;
+            let pairs = PathBuf::from(spaces::expand_home(&pairs));
+            let r = eval::run(&conn, &pairs)?;
+            println!(
+                "pairs {} (unreachable {}), latency p50 {:.0} ms p95 {:.0} ms",
+                r.total, r.unreachable, r.p50_ms, r.p95_ms
+            );
+            for (space, s) in std::iter::once(("overall".to_string(), &r.overall))
+                .chain(r.by_space.iter().map(|(k, v)| (k.clone(), v)))
+            {
+                println!(
+                    "  {space:<22} n={:<4} hit@5 {:.1}%  mrr {:.3}",
+                    s.pairs,
+                    100.0 * s.hit5 as f64 / s.pairs.max(1) as f64,
+                    s.mrr
+                );
+            }
+            if let Some(path) = rows {
+                std::fs::write(&path, serde_json::to_string_pretty(&r.rows)?)?;
+            }
+            if let Some(dirs) = isolation {
+                let (q, leaks) = eval::isolation(&conn, &pairs, &dirs[0], &dirs[1])?;
+                println!("isolation: {q} searches, {leaks} results from the other domain");
+            }
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Review(cmd) => {

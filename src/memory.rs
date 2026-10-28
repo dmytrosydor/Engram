@@ -13,6 +13,9 @@ use crate::embed;
 use crate::store::{self, BODY_MAX, Inserted, KINDS, NewItem, TITLE_MAX};
 
 const CANDIDATES: usize = 30;
+/// Nearest neighbours fetched before the space filter; the larger pool is
+/// sqlite-vec's maximum `k`.
+const KNN_POOLS: [usize; 2] = [400, 4096];
 const RRF_K: f64 = 60.0;
 /// Cosine at or above which `write` asks before adding.
 pub const SIMILAR: f32 = 0.88;
@@ -99,6 +102,9 @@ pub struct Query<'a> {
     pub scope: Scope,
     pub kind: Option<&'a str>,
     pub limit: usize,
+    /// Search as of this moment (evaluation replays old queries): later items are
+    /// hidden and ages count from here. None = now.
+    pub as_of: Option<&'a str>,
 }
 
 /// Hybrid search: two FTS lists and one vector list fused with RRF, then boosted.
@@ -130,13 +136,7 @@ pub fn search(conn: &Connection, q: &Query) -> Result<Vec<Hit>> {
         lists.push(ids(conn, &sql, all)?);
     }
     if let Some(v) = q.vector {
-        let sql = format!(
-            "SELECT i.id FROM item i JOIN item_vec v ON v.item_id = i.id
-             WHERE {filter} ORDER BY vec_distance_cosine(v.emb, ?) LIMIT {CANDIDATES}"
-        );
-        let mut all = args.clone();
-        all.push(Value::Blob(embed::to_blob(v)));
-        lists.push(ids(conn, &sql, all)?);
+        lists.push(nearest(conn, v, &filter, &args)?);
     }
 
     let mut fused: HashMap<i64, f64> = HashMap::new();
@@ -158,9 +158,9 @@ pub fn search(conn: &Connection, q: &Query) -> Result<Vec<Hit>> {
             f64,
         ) = conn.query_row(
             "SELECT kind, space_id, status, created_at, title, hits, pinned,
-                        MAX(0, julianday('now') - julianday(created_at))
+                        MAX(0, julianday(COALESCE(?2, 'now')) - julianday(created_at))
                  FROM item WHERE id = ?1",
-            [id],
+            params![id, q.as_of],
             |r| {
                 Ok((
                     r.get(0)?,
@@ -180,9 +180,6 @@ pub fn search(conn: &Connection, q: &Query) -> Result<Vec<Hit>> {
         }
         if matches!(kind.as_str(), "state" | "event") {
             score *= 0.5f64.powf(age / 90.0);
-        }
-        if status == "proposed" {
-            score *= 0.7;
         }
         hits.push(Hit {
             id,
@@ -244,7 +241,39 @@ fn filter(q: &Query) -> (String, Vec<Value>) {
         sql.push("i.kind = ?".into());
         args.push(Value::Text(kind.into()));
     }
+    if let Some(t) = q.as_of {
+        sql.push("julianday(i.created_at) <= julianday(?)".into());
+        args.push(Value::Text(t.into()));
+    }
     (sql.join(" AND "), args)
+}
+
+/// Vector candidates. vec0's own KNN over everything is fast (a point lookup per row
+/// is not), so take the nearest items overall and filter them. Small visible sets may
+/// keep too few, so retry with a bigger pool; past that, scan the visible set exactly.
+fn nearest(conn: &Connection, v: &[f32], filter: &str, args: &[Value]) -> Result<Vec<i64>> {
+    // the vector is ?1; the filter's anonymous placeholders continue from 2
+    let mut all = vec![Value::Blob(embed::to_blob(v))];
+    all.extend(args.iter().cloned());
+    for pool in KNN_POOLS {
+        let knn = format!(
+            "WITH knn AS (SELECT item_id, distance FROM item_vec WHERE emb MATCH ?1 AND k = {pool})
+             SELECT i.id FROM knn JOIN item i ON i.id = knn.item_id
+             WHERE {filter} ORDER BY knn.distance LIMIT {CANDIDATES}"
+        );
+        let found = ids(conn, &knn, all.clone())?;
+        if found.len() == CANDIDATES {
+            return Ok(found);
+        }
+    }
+    // here the filter comes first in the text, so the vector is the last placeholder
+    let exact = format!(
+        "SELECT i.id FROM item i JOIN item_vec v ON v.item_id = i.id
+         WHERE {filter} ORDER BY vec_distance_cosine(v.emb, ?) LIMIT {CANDIDATES}"
+    );
+    let mut last = args.to_vec();
+    last.push(Value::Blob(embed::to_blob(v)));
+    ids(conn, &exact, last)
 }
 
 fn ids(conn: &Connection, sql: &str, args: Vec<Value>) -> Result<Vec<i64>> {
@@ -496,6 +525,7 @@ pub fn similar(conn: &Connection, v: &[f32], spaces: &[String]) -> Result<Vec<(H
         scope: Scope::Project,
         kind: None,
         limit: 3,
+        as_of: None,
     };
     let (filter, filter_args) = filter(&q);
     // the vector is ?1; the filter's anonymous placeholders continue from 2
