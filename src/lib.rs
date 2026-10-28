@@ -8,6 +8,7 @@ pub mod eval;
 pub mod hook;
 pub mod import;
 pub mod index;
+pub mod install;
 pub mod mcp;
 pub mod memory;
 pub mod review;

@@ -83,6 +83,17 @@ enum Cmd {
     /// The review queue
     #[command(subcommand)]
     Review(ReviewCmd),
+    /// Register the SessionStart hook, the MCP server and the daily launchd agent
+    Install {
+        /// Apply; without it only the plan is printed
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Undo `install` (data stays)
+    Uninstall {
+        #[arg(long)]
+        yes: bool,
+    },
     /// Local web UI on 127.0.0.1
     Ui {
         #[arg(long, default_value_t = 7777)]
@@ -353,6 +364,14 @@ fn main() -> Result<ExitCode> {
                 let (q, leaks) = eval::isolation(&conn, &pairs, &dirs[0], &dirs[1])?;
                 println!("isolation: {q} searches, {leaks} results from the other domain");
             }
+            Ok(ExitCode::SUCCESS)
+        }
+        Cmd::Install { yes } => {
+            engram::install::install(yes)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Cmd::Uninstall { yes } => {
+            engram::install::uninstall(yes)?;
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Ui { port } => {
