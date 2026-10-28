@@ -299,20 +299,28 @@ fn tokens(text: &str) -> Vec<String> {
 // ---------- get ----------
 
 /// Full items with confirmed links; counts as a hit and as an "open" of the last search.
-pub fn get(conn: &Connection, ids: &[i64], session: &str) -> Result<String> {
+/// `visible` limits which spaces may be read (sessions); None reads anything (CLI).
+pub fn get(
+    conn: &Connection,
+    ids: &[i64],
+    session: &str,
+    visible: Option<&[String]>,
+) -> Result<String> {
     let mut out = Vec::new();
     for &id in ids {
-        let text: Option<String> = conn
+        let row: Option<(String, String)> = conn
             .query_row(
-                "SELECT '#' || id || ' ' || kind || ' ' || space_id || ' ' || status || ' '
+                "SELECT space_id, '#' || id || ' ' || kind || ' ' || space_id || ' ' || status || ' '
                         || substr(created_at, 1, 10)
                         || COALESCE(' until ' || valid_until, '') || COALESCE(' src ' || source, '')
                         || char(10) || title || char(10) || body
                  FROM item WHERE id = ?1",
                 [id],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
+        let text = row
+            .and_then(|(space, text)| visible.is_none_or(|v| v.contains(&space)).then_some(text));
         let Some(mut text) = text else {
             out.push(format!("#{id} not found"));
             continue;
@@ -367,8 +375,10 @@ pub struct Write<'a> {
     pub mode: Option<&'a str>,
     /// Embedding of title + body, if the model is available.
     pub vector: Option<&'a [f32]>,
-    /// Spaces checked for similar items.
+    /// Spaces checked for similar items, and the only ones update / supersede may touch.
     pub visible: &'a [String],
+    /// Status of a new item: "active", or "proposed" when it needs a person's yes.
+    pub status: &'a str,
 }
 
 #[derive(Debug)]
@@ -438,6 +448,22 @@ pub fn write(conn: &Connection, w: &Write, actor: &str) -> Result<Written> {
     if w.mode.is_some_and(|m| m != "add") && update.is_none() && supersede.is_none() {
         bail!("mode must be add, update:<id> or supersede:<id>");
     }
+    // a session may only change live items it can see
+    for id in update.iter().chain(supersede.iter()) {
+        let target: Option<(String, String)> = conn
+            .query_row(
+                "SELECT space_id, status FROM item WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        match target {
+            Some((space, status))
+                if w.visible.contains(&space) && (status == "active" || status == "proposed") => {}
+            Some((_, status)) if w.visible.is_empty() => bail!("#{id} is {status}"),
+            _ => bail!("#{id} is not a live item visible from this session"),
+        }
+    }
 
     if w.mode.is_none()
         && let Some(v) = w.vector
@@ -479,7 +505,7 @@ pub fn write(conn: &Connection, w: &Write, actor: &str) -> Result<Written> {
             kind: w.kind.into(),
             title: title.into(),
             body: body.into(),
-            status: "active".into(),
+            status: w.status.into(),
             source: w.source.map(str::to_string),
             valid_until: w.valid_until.map(str::to_string),
             ..NewItem::default()

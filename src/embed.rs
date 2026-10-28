@@ -98,6 +98,12 @@ pub fn embed(texts: &[&str]) -> Result<Vec<Vec<f32>>> {
             return texts.iter().map(|t| embed_one(t)).collect();
         }
         let shorter = truncate(texts[0], texts[0].chars().count().min(MAX_CHARS) / 2);
+        if shorter.is_empty() {
+            bail!(
+                "llama-server refuses even a short input: {}",
+                truncate(&resp, 300)
+            );
+        }
         return embed(&[shorter]);
     }
     if status != 200 {

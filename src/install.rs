@@ -26,8 +26,15 @@ fn plist_path() -> PathBuf {
     home().join(format!("Library/LaunchAgents/{LABEL}.plist"))
 }
 
+/// The binary as invoked; not canonicalised, so a stable symlink (e.g. in
+/// ~/.cargo/bin or /opt/homebrew/bin) survives upgrades.
 fn exe() -> Result<PathBuf> {
-    Ok(std::env::current_exe()?.canonicalize()?)
+    Ok(std::env::current_exe()?)
+}
+
+/// Single-quoted for the shell Claude Code runs hook commands in.
+fn shell_quote(p: &Path) -> String {
+    format!("'{}'", p.to_string_lossy().replace('\'', r"'\''"))
 }
 
 pub fn install(apply: bool) -> Result<()> {
@@ -38,7 +45,7 @@ pub fn install(apply: bool) -> Result<()> {
             exe.display()
         );
     }
-    let hook = format!("{} {HOOK_ARGS}", exe.display());
+    let hook = format!("{} {HOOK_ARGS}", shell_quote(&exe));
     let claude = which("claude").context("claude CLI not found on PATH")?;
 
     println!(
@@ -76,7 +83,7 @@ pub fn install(apply: bool) -> Result<()> {
         spaces::load(&conn, &spaces_file)?;
     }
 
-    edit_settings(|s| add_hook(s, &hook))?;
+    edit_settings(|s| set_hook(s, &hook))?;
 
     let listed = Command::new(&claude)
         .args(["mcp", "get", "engram"])
@@ -142,12 +149,20 @@ pub fn uninstall(apply: bool) -> Result<()> {
 }
 
 /// Applies `change` to settings.json after a timestamped backup; no-op if unchanged.
-fn edit_settings(change: impl FnOnce(&mut Value) -> bool) -> Result<()> {
+/// Refuses to touch a file it cannot read or parse as a JSON object.
+fn edit_settings(change: impl FnOnce(&mut Value) -> Result<bool>) -> Result<()> {
     let path = settings_path();
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|_| "{}".into());
-    let mut settings: Value =
-        serde_json::from_str(&text).context("settings.json is not valid JSON")?;
-    if !change(&mut settings) {
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => "{}".into(),
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+    let mut settings: Value = serde_json::from_str(&text)
+        .with_context(|| format!("{} is not valid JSON", path.display()))?;
+    if !settings.is_object() {
+        bail!("{} is not a JSON object; not touching it", path.display());
+    }
+    if !change(&mut settings)? {
         println!("   settings.json already up to date");
         return Ok(());
     }
@@ -160,54 +175,81 @@ fn edit_settings(change: impl FnOnce(&mut Value) -> bool) -> Result<()> {
         std::fs::copy(&path, &backup)?;
         println!("   backup {}", backup.display());
     }
-    std::fs::write(&path, serde_json::to_string_pretty(&settings)? + "\n")?;
+    // write aside and rename, so a crash never leaves a half-written settings file
+    let tmp = path.with_extension("json.engram-tmp");
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all((serde_json::to_string_pretty(&settings)? + "\n").as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, &path)?;
     Ok(())
 }
 
-/// Adds the engram SessionStart hook unless one is there. Returns whether it changed.
-pub fn add_hook(settings: &mut Value, command: &str) -> bool {
-    if !settings.is_object() {
-        *settings = json!({});
-    }
-    let hooks = settings
+/// Makes `command` the one engram SessionStart hook: replaces an entry pointing at
+/// another engram binary, adds one if missing. Returns whether anything changed.
+pub fn set_hook(settings: &mut Value, command: &str) -> Result<bool> {
+    let root = settings
         .as_object_mut()
-        .map(|o| o.entry("hooks").or_insert_with(|| json!({})))
-        .expect("object");
-    let Some(groups) = hooks
+        .context("settings is not an object")?;
+    let hooks = root
+        .entry("hooks")
+        .or_insert_with(|| json!({}))
         .as_object_mut()
-        .map(|o| o.entry("SessionStart").or_insert_with(|| json!([])))
-        .and_then(Value::as_array_mut)
-    else {
-        return false;
-    };
-    let present = groups.iter().any(|g| {
-        g["hooks"].as_array().is_some_and(|hs| {
-            hs.iter().any(|h| {
-                h["command"]
-                    .as_str()
-                    .is_some_and(|c| c.ends_with(HOOK_ARGS))
-            })
-        })
-    });
-    if present {
-        return false;
+        .context("settings.hooks is not an object")?;
+    let groups = hooks
+        .entry("SessionStart")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .context("settings.hooks.SessionStart is not an array")?;
+    let mut found = false;
+    let mut changed = false;
+    for g in groups.iter_mut() {
+        let Some(hs) = g.get_mut("hooks").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for h in hs.iter_mut() {
+            let Some(current) = h.get("command").and_then(Value::as_str) else {
+                continue;
+            };
+            if is_engram_hook(current) {
+                found = true;
+                if current != command {
+                    h["command"] = json!(command);
+                    changed = true;
+                }
+            }
+        }
     }
-    groups.push(json!({"hooks": [{"type": "command", "command": command, "timeout": 5}]}));
-    true
+    if !found {
+        groups.push(json!({"hooks": [{"type": "command", "command": command, "timeout": 5}]}));
+        changed = true;
+    }
+    Ok(changed)
+}
+
+fn is_engram_hook(command: &str) -> bool {
+    command.trim_end().ends_with(HOOK_ARGS)
 }
 
 /// Removes engram's SessionStart hook, dropping groups and events left empty.
-pub fn remove_hook(settings: &mut Value) -> bool {
-    let Some(groups) = settings["hooks"]["SessionStart"].as_array_mut() else {
-        return false;
+pub fn remove_hook(settings: &mut Value) -> Result<bool> {
+    let Some(groups) = settings
+        .get_mut("hooks")
+        .and_then(|h| h.get_mut("SessionStart"))
+        .and_then(Value::as_array_mut)
+    else {
+        return Ok(false);
     };
     let before = groups.len();
     for g in groups.iter_mut() {
-        if let Some(hs) = g["hooks"].as_array_mut() {
+        // get_mut, not IndexMut: a hand-edited entry of another shape must not panic
+        if let Some(hs) = g.get_mut("hooks").and_then(Value::as_array_mut) {
             hs.retain(|h| {
-                !h["command"]
-                    .as_str()
-                    .is_some_and(|c| c.ends_with(HOOK_ARGS))
+                !h.get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_engram_hook)
             });
         }
     }
@@ -218,7 +260,7 @@ pub fn remove_hook(settings: &mut Value) -> bool {
     {
         h.remove("SessionStart");
     }
-    changed
+    Ok(changed)
 }
 
 fn plist(exe: &Path, path_env: &str) -> String {
@@ -286,13 +328,20 @@ mod tests {
             "hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "other.sh"}]}],
                       "Stop": [{"hooks": [{"type": "command", "command": "stop.sh"}]}]}
         });
-        assert!(add_hook(&mut s, "/bin/engram hook session-start"));
-        assert!(!add_hook(&mut s, "/bin/engram hook session-start"));
+        assert!(set_hook(&mut s, "'/bin/engram' hook session-start").unwrap());
+        assert!(!set_hook(&mut s, "'/bin/engram' hook session-start").unwrap());
         assert_eq!(s["hooks"]["SessionStart"].as_array().unwrap().len(), 2);
+        // a stale binary path is replaced, not duplicated
+        assert!(set_hook(&mut s, "'/new/engram' hook session-start").unwrap());
+        assert_eq!(s["hooks"]["SessionStart"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            s["hooks"]["SessionStart"][1]["hooks"][0]["command"],
+            "'/new/engram' hook session-start"
+        );
         // key order of the user's file is preserved
         assert_eq!(s.as_object().unwrap().keys().next().unwrap(), "model");
 
-        assert!(remove_hook(&mut s));
+        assert!(remove_hook(&mut s).unwrap());
         assert_eq!(
             s["hooks"]["SessionStart"][0]["hooks"][0]["command"],
             "other.sh"
@@ -300,8 +349,14 @@ mod tests {
         assert_eq!(s["hooks"]["Stop"][0]["hooks"][0]["command"], "stop.sh");
 
         let mut only = json!({});
-        add_hook(&mut only, "/bin/engram hook session-start");
-        remove_hook(&mut only);
+        set_hook(&mut only, "/bin/engram hook session-start").unwrap();
+        remove_hook(&mut only).unwrap();
         assert!(only["hooks"].get("SessionStart").is_none());
+
+        assert!(
+            set_hook(&mut json!({"hooks": []}), "x hook session-start").is_err(),
+            "wrong type is an error"
+        );
+        assert_eq!(shell_quote(Path::new("/a b/it's")), r"'/a b/it'\''s'");
     }
 }

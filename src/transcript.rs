@@ -20,8 +20,12 @@ pub struct Transcript {
     pub text: String,
 }
 
-/// Top-level transcripts modified after `since`, newest first, skipping `exclude` folders.
-pub fn changed_since(root: &Path, since: SystemTime, exclude: &[PathBuf]) -> Result<Vec<PathBuf>> {
+/// Top-level transcripts modified after `since`, oldest first, skipping `exclude` folders.
+pub fn changed_since(
+    root: &Path,
+    since: SystemTime,
+    exclude: &[PathBuf],
+) -> Result<Vec<(SystemTime, PathBuf)>> {
     let mut found: Vec<(SystemTime, PathBuf)> = Vec::new();
     let Ok(dirs) = std::fs::read_dir(root) else {
         return Ok(Vec::new());
@@ -31,7 +35,10 @@ pub fn changed_since(root: &Path, since: SystemTime, exclude: &[PathBuf]) -> Res
         if !dir.is_dir() || exclude.iter().any(|e| e == &dir) {
             continue;
         }
-        for f in std::fs::read_dir(&dir)?.flatten() {
+        let Ok(files) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for f in files.flatten() {
             let p = f.path();
             if p.extension().is_some_and(|e| e == "jsonl")
                 && let Ok(m) = f.metadata().and_then(|m| m.modified())
@@ -41,8 +48,8 @@ pub fn changed_since(root: &Path, since: SystemTime, exclude: &[PathBuf]) -> Res
             }
         }
     }
-    found.sort_by_key(|(m, _)| std::cmp::Reverse(*m));
-    Ok(found.into_iter().map(|(_, p)| p).collect())
+    found.sort_by_key(|(m, _)| *m);
+    Ok(found)
 }
 
 pub fn read(path: &Path) -> Result<Transcript> {

@@ -51,6 +51,7 @@ fn put(
             mode: Some("add"),
             vector: v.as_deref(),
             visible: &vis,
+            status: "active",
         },
         "test",
     )
@@ -164,6 +165,7 @@ fn write_asks_before_near_duplicates_and_supports_modes() {
         mode: None,
         vector: Some(&axis(5)),
         visible: &vis,
+        status: "active",
     };
 
     match memory::write(&conn, &base, "test").unwrap() {
@@ -239,6 +241,7 @@ fn write_validates_input() {
         mode: Some("add"),
         vector: None,
         visible: &vis,
+        status: "active",
     };
     assert!(
         memory::write(
@@ -302,7 +305,7 @@ fn get_counts_hits_and_marks_recall_open() {
     )
     .unwrap();
     memory::log_recall(&conn, "s1", "work/acme", "port", &hits).unwrap();
-    let text = memory::get(&conn, &[a, 999], "s1").unwrap();
+    let text = memory::get(&conn, &[a, 999], "s1", None).unwrap();
     assert!(text.contains("UI listens on 7777") && text.contains("#999 not found"));
     let (n, opened): (i64, String) = conn
         .query_row(
@@ -312,4 +315,50 @@ fn get_counts_hits_and_marks_recall_open() {
         )
         .unwrap();
     assert_eq!((n, opened), (1, format!("[{a}]")));
+}
+
+#[test]
+fn sessions_cannot_touch_or_read_other_domains() {
+    let (_d, conn) = setup();
+    let work = put(
+        &conn,
+        "work/acme",
+        "fact",
+        "Stand IP",
+        "The stand is at 10.0.0.5",
+        None,
+    );
+    let personal = visible(&conn, "personal/side");
+    for mode in [format!("update:{work}"), format!("supersede:{work}")] {
+        let w = Write {
+            kind: "fact",
+            title: "x",
+            body: "overwritten",
+            space: "personal/side",
+            source: None,
+            valid_until: None,
+            mode: Some(&mode),
+            vector: None,
+            visible: &personal,
+            status: "active",
+        };
+        assert!(
+            memory::write(&conn, &w, "t").is_err(),
+            "{mode} crossed domains"
+        );
+    }
+    let body: String = conn
+        .query_row("SELECT body FROM item WHERE id = ?1", [work], |r| r.get(0))
+        .unwrap();
+    assert_eq!(body, "The stand is at 10.0.0.5");
+    assert!(
+        memory::get(&conn, &[work], "s", Some(&personal))
+            .unwrap()
+            .contains("not found")
+    );
+    assert!(
+        memory::get(&conn, &[work], "s", None)
+            .unwrap()
+            .contains("10.0.0.5")
+    );
 }

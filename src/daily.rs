@@ -26,6 +26,7 @@ pub const ACTOR: &str = "daily";
 const NEAR_DUP: f32 = 0.92;
 const CLASSIFY_BATCH: usize = 40;
 const PAIR_BATCH: usize = 20;
+const CLAUDE_TIMEOUT: Duration = Duration::from_secs(600);
 
 const SYSTEM: &str = "You curate a developer's long-term memory for Claude Code sessions. \
 Reply with JSON only, no prose, no code fences.";
@@ -66,14 +67,38 @@ impl Llm for ClaudeCli {
             .take()
             .context("stdin")?
             .write_all(prompt.as_bytes())?;
-        let out = child.wait_with_output()?;
-        if !out.status.success() {
-            bail!(
-                "claude failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
+        // read the pipes on threads so a large reply cannot block the child
+        let mut stdout = child.stdout.take().context("stdout")?;
+        let mut stderr = child.stderr.take().context("stderr")?;
+        let out = std::thread::spawn(move || {
+            let mut s = String::new();
+            std::io::Read::read_to_string(&mut stdout, &mut s).map(|_| s)
+        });
+        let err = std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = std::io::Read::read_to_string(&mut stderr, &mut s);
+            s
+        });
+        let deadline = std::time::Instant::now() + CLAUDE_TIMEOUT;
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("claude did not answer in {CLAUDE_TIMEOUT:?}");
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        };
+        let stdout = out
+            .join()
+            .map_err(|_| anyhow::anyhow!("stdout reader panicked"))??;
+        if !status.success() {
+            let stderr = err.join().unwrap_or_default();
+            bail!("claude failed: {}", stderr.trim());
         }
-        Ok(String::from_utf8(out.stdout)?)
+        Ok(stdout)
     }
 }
 
@@ -96,6 +121,7 @@ pub struct Report {
     pub pairs_queued: usize,
     pub classified: usize,
     pub archived: usize,
+    /// Moves to `global` queued for review.
     pub moved_global: usize,
     pub transcripts: usize,
     pub notes: usize,
@@ -130,26 +156,40 @@ pub fn run(
     opts: &Options,
     mut say: impl FnMut(&str),
 ) -> Result<Report> {
+    // one run at a time per database (launchd tick vs a manual run)
+    let lock_path = format!("{}.daily.lock", conn.path().unwrap_or("engram"));
+    let lock = std::fs::File::create(&lock_path)?;
+    if lock.try_lock().is_err() {
+        bail!("another daily run is in progress");
+    }
+
     let mut r = Report::default();
     let started = store::now(conn)?;
     let started_ns = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)?
         .as_nanos();
-    let last = meta(conn, "daily_last_ts")?;
 
     r.expired = expire(conn)?;
     say(&format!("expired {}", r.expired));
 
-    let pairs = near_duplicates(conn, last.as_deref())?;
+    let pairs = near_duplicates(conn, meta(conn, "dup_since")?.as_deref())?;
     r.pairs_found = pairs.len();
+    let mut judged = 0;
     for batch in pairs
         .chunks(PAIR_BATCH)
         .take(opts.pairs.div_ceil(PAIR_BATCH))
     {
         match judge_pairs(conn, llm, batch) {
-            Ok(n) => r.pairs_queued += n,
+            Ok(n) => {
+                r.pairs_queued += n;
+                judged += batch.len();
+            }
             Err(e) => r.errors.push(format!("pairs: {e:#}")),
         }
+    }
+    // probe the same items again next time until every pair has an answer
+    if judged == pairs.len() {
+        set_meta(conn, "dup_since", &started)?;
     }
     say(&format!(
         "pairs {} found, {} queued",
@@ -177,11 +217,22 @@ pub fn run(
         .and_then(|ns| ns.parse::<u64>().ok())
         .map(|ns| SystemTime::UNIX_EPOCH + Duration::from_nanos(ns))
         .unwrap_or_else(|| SystemTime::now() - Duration::from_secs(24 * 3600));
-    for path in transcript::changed_since(&opts.projects, since, &opts.exclude)?
-        .into_iter()
-        .take(opts.transcripts)
-    {
-        let t = transcript::read(&path)?;
+    let changed = transcript::changed_since(&opts.projects, since, &opts.exclude)?;
+    // oldest first; if some are left for tomorrow, resume right after the last one read
+    let mut next_since = started_ns;
+    let more = changed.len() > opts.transcripts;
+    for (mtime, path) in changed.into_iter().take(opts.transcripts) {
+        if more {
+            next_since = mtime.duration_since(SystemTime::UNIX_EPOCH)?.as_nanos();
+        }
+        let t = match transcript::read(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                r.errors
+                    .push(format!("transcript {}: {e:#}", path.display()));
+                continue;
+            }
+        };
         if t.text.chars().count() < 400 {
             continue;
         }
@@ -211,7 +262,7 @@ pub fn run(
         r.transcripts, r.proposals
     ));
 
-    collect_inbox_dir(conn, &opts.inbox_dir)?;
+    r.errors.extend(collect_inbox_dir(conn, &opts.inbox_dir));
     for (id, space, source, raw) in inbox(conn)? {
         match extract(conn, llm, &space, &raw, source.as_deref().unwrap_or("note")) {
             Ok((added, known)) => {
@@ -229,8 +280,7 @@ pub fn run(
 
     r.cores = core::rebuild_all(conn)?.len();
     set_meta(conn, "daily_last_run", &store::today(conn)?)?;
-    set_meta(conn, "daily_last_ts", &started)?;
-    set_meta(conn, "daily_last_ns", &started_ns.to_string())?;
+    set_meta(conn, "daily_last_ns", &next_since.to_string())?;
     store::log(
         conn,
         ACTOR,
@@ -419,11 +469,20 @@ fn classify(conn: &Connection, llm: &dyn Llm, batch: &[i64]) -> Result<(usize, u
             "active"
         };
         conn.execute(
-            "UPDATE item SET status = ?2, kind = COALESCE(?3, kind),
-                             space_id = CASE WHEN ?4 THEN 'global' ELSE space_id END, updated_at = ?5
-             WHERE id = ?1",
-            params![v.id, status, kind, to_global, store::now(conn)?],
+            "UPDATE item SET status = ?2, kind = COALESCE(?3, kind), updated_at = ?4 WHERE id = ?1",
+            params![v.id, status, kind, store::now(conn)?],
         )?;
+        // global items reach every session's core, so that move waits for a person
+        if to_global {
+            review::add(
+                conn,
+                "move",
+                &[v.id],
+                &json!({"space": "global"}),
+                "classified as true in every project",
+                "open",
+            )?;
+        }
         store::log(
             conn,
             ACTOR,
@@ -490,6 +549,10 @@ fn extract(
             known += 1;
             continue;
         }
+        if review::proposal_known(conn, target, &title)? {
+            known += 1;
+            continue;
+        }
         let p = NewProposal {
             kind: e.kind,
             title,
@@ -504,30 +567,38 @@ fn extract(
 }
 
 /// Moves `*.md` / `*.txt` notes from the inbox folder into the inbox table.
-fn collect_inbox_dir(conn: &Connection, dir: &Path) -> Result<()> {
+/// A file is moved aside before it is stored, so a failure never repeats hourly.
+fn collect_inbox_dir(conn: &Connection, dir: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return Ok(());
+        return Vec::new();
     };
     let done = dir.join("processed");
+    let mut errors = Vec::new();
     for f in entries.flatten() {
         let p = f.path();
         if !p.is_file() || !p.extension().is_some_and(|e| e == "md" || e == "txt") {
             continue;
         }
-        let raw = std::fs::read_to_string(&p)?;
-        add_note(
-            conn,
-            spaces::INBOX,
-            &raw,
-            &format!(
-                "note:{}",
-                p.file_name().unwrap_or_default().to_string_lossy()
-            ),
-        )?;
-        std::fs::create_dir_all(&done)?;
-        std::fs::rename(&p, done.join(p.file_name().unwrap_or_default()))?;
+        let name = p.file_name().unwrap_or_default().to_owned();
+        let moved = done.join(&name);
+        let stored = std::fs::create_dir_all(&done)
+            .and_then(|()| std::fs::rename(&p, &moved))
+            .and_then(|()| std::fs::read(&moved))
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| {
+                let raw = String::from_utf8_lossy(&bytes);
+                add_note(
+                    conn,
+                    spaces::INBOX,
+                    &raw,
+                    &format!("note:{}", name.to_string_lossy()),
+                )
+            });
+        if let Err(e) = stored {
+            errors.push(format!("inbox file {}: {e:#}", p.display()));
+        }
     }
-    Ok(())
+    errors
 }
 
 pub fn add_note(conn: &Connection, space: &str, raw: &str, source: &str) -> Result<i64> {
@@ -581,6 +652,9 @@ fn ask_json<T: for<'de> Deserialize<'de>>(llm: &dyn Llm, prompt: &str) -> Result
 fn parse_json<T: for<'de> Deserialize<'de>>(reply: &str) -> Result<Vec<T>> {
     let start = reply.find('[').context("no JSON array in reply")?;
     let end = reply.rfind(']').context("no JSON array in reply")?;
+    if end < start {
+        bail!("no JSON array in reply");
+    }
     // items the model got wrong are skipped rather than failing the batch
     let values: Vec<serde_json::Value> =
         serde_json::from_str(&reply[start..=end]).context("reply is not JSON")?;

@@ -253,7 +253,17 @@ async fn queue() -> Html<String> {
         }
         let mut out = format!("<p class=meta>{} пропозицій</p>", open.len());
         for e in open {
-            out.push_str(&review_card(conn, &e)?);
+            // one broken proposal must not hide the rest of the queue
+            match review_card(conn, &e) {
+                Ok(card) => out.push_str(&card),
+                Err(err) => write!(
+                    out,
+                    "<div class=row id=r{id}><p class=err>R{id}: {}</p><div class=acts>\
+                     <button class=bad hx-post=/review/{id}/reject hx-target=#r{id} hx-swap=outerHTML>Відхилити</button></div></div>",
+                    esc(&format!("{err:#}")),
+                    id = e.id
+                )?,
+            }
         }
         Ok(out)
     })
@@ -302,6 +312,24 @@ fn review_card(conn: &Connection, e: &review::Entry) -> Result<String> {
                  <button class=bad hx-post=/review/{id}/reject hx-target=#r{id} hx-swap=outerHTML>Ні, різні</button></div>",
                 brief(conn, keep)?,
                 brief(conn, drop)?
+            )?;
+        }
+        "move" | "activate" => {
+            let item = e.item_ids.first().copied().unwrap_or(0);
+            let what = if e.op == "move" {
+                format!(
+                    "перенести в <b>{}</b>",
+                    esc(e.proposal["space"].as_str().unwrap_or("?"))
+                )
+            } else {
+                "зробити активним (з'явиться в ядрах)".to_string()
+            };
+            write!(
+                out,
+                "<div>{what}: {}</div>\
+                 <div class=acts><button class=ok hx-post=/review/{id}/accept hx-target=#r{id} hx-swap=outerHTML>Так</button>\
+                 <button class=bad hx-post=/review/{id}/reject hx-target=#r{id} hx-swap=outerHTML>Ні</button></div>",
+                brief(conn, item)?
             )?;
         }
         other => write!(
@@ -449,7 +477,15 @@ async fn item_action(Path((id, action)): Path<(i64, String)>) -> Html<String> {
             "pin" => store::set_pinned(conn, id, true, ACTOR)?,
             "unpin" => store::set_pinned(conn, id, false, ACTOR)?,
             "archive" => store::set_status(conn, id, "archived", None, ACTOR)?,
-            "restore" => store::set_status(conn, id, "active", None, ACTOR)?,
+            "restore" => {
+                // superseded items stay retired: their replacement is the live one
+                let status: String =
+                    conn.query_row("SELECT status FROM item WHERE id = ?1", [id], |r| r.get(0))?;
+                if status != "archived" {
+                    anyhow::bail!("only archived items can be restored (this one is {status})");
+                }
+                store::set_status(conn, id, "active", None, ACTOR)?
+            }
             other => anyhow::bail!("unknown action {other}"),
         }
         let space: String =
@@ -508,10 +544,15 @@ async fn item_edit(Path(id): Path<i64>, Form(f): Form<Edited>) -> Html<String> {
     blocking(move |conn| {
         let title = f.title.trim();
         let body = f.body.trim();
-        if title.is_empty() || body.is_empty() || title.chars().count() > store::TITLE_MAX {
+        if title.is_empty()
+            || body.is_empty()
+            || title.chars().count() > store::TITLE_MAX
+            || body.chars().count() > store::BODY_MAX
+        {
             anyhow::bail!(
-                "заголовок 1–{} символів, текст не порожній",
-                store::TITLE_MAX
+                "заголовок 1–{} символів, текст 1–{} символів",
+                store::TITLE_MAX,
+                store::BODY_MAX
             );
         }
         let old_space: String =
@@ -560,7 +601,7 @@ async fn map() -> Html<String> {
                 out,
                 "<div class=row><b>{}</b><div class=meta>{} · ядро ~{tokens} ток.</div>\
                  <div>{active} активних · {proposed} неперевірених · {retired} в архіві</div>\
-                 <div class=acts><button onclick=\"show('{}')\">граф</button></div></div>",
+                 <div class=acts><button data-space='{}' onclick=\"show(this.dataset.space)\">граф</button></div></div>",
                 esc(&id),
                 esc(&domain),
                 esc(&id)

@@ -99,7 +99,7 @@ impl Server {
         let me = self.clone();
         run(move || {
             let conn = db::connect(&me.db)?;
-            memory::get(&conn, &a.ids, &me.session)
+            memory::get(&conn, &a.ids, &me.session, Some(&me.visible))
         })
         .await
     }
@@ -143,6 +143,7 @@ impl Server {
 
     fn do_write(&self, a: WriteArgs) -> Result<String> {
         let conn = db::connect(&self.db)?;
+        let space = a.space.as_deref().unwrap_or(&self.space);
         let vector = embed::embed_one(&index::item_text(a.title.trim(), a.body.trim())).ok();
         let written = memory::write(
             &conn,
@@ -150,12 +151,18 @@ impl Server {
                 kind: &a.kind,
                 title: &a.title,
                 body: &a.body,
-                space: a.space.as_deref().unwrap_or(&self.space),
+                space,
                 source: a.source.as_deref(),
                 valid_until: a.valid_until.as_deref(),
                 mode: a.mode.as_deref(),
                 vector: vector.as_deref(),
                 visible: &self.visible,
+                // global items reach every session's core: a person confirms them first
+                status: if space == "global" {
+                    "proposed"
+                } else {
+                    "active"
+                },
             },
             &self.session,
         )?;
@@ -163,10 +170,34 @@ impl Server {
             written,
             memory::Written::Similar(_) | memory::Written::Exists(_)
         ) {
-            // cores are cheap to rebuild; keep this session's one current
-            crate::core::rebuild(&conn, a.space.as_deref().unwrap_or(&self.space))?;
+            // cores are cheap; global and _shared items, or an edit anywhere, touch many
+            if space == "global"
+                || space.ends_with("/_shared")
+                || matches!(written, memory::Written::Updated(_))
+            {
+                crate::core::rebuild_all(&conn)?;
+            } else {
+                crate::core::rebuild(&conn, space)?;
+            }
         }
-        Ok(written.message())
+        let mut msg = written.message();
+        if space == "global"
+            && let memory::Written::Created(id) | memory::Written::Superseded { new: id, .. } =
+                written
+        {
+            crate::review::add(
+                &conn,
+                "activate",
+                &[id],
+                &serde_json::json!({}),
+                "global write from a session",
+                "open",
+            )?;
+            msg.push_str(
+                " (global: waits for review in engram ui before it reaches every session)",
+            );
+        }
+        Ok(msg)
     }
 }
 

@@ -37,6 +37,7 @@ fn put(conn: &Connection, space: &str, kind: &str, title: &str, valid_until: Opt
         mode: Some("add"),
         vector: None,
         visible: &vis,
+        status: "active",
     };
     match memory::write(conn, &w, "test").unwrap() {
         memory::Written::Created(id) => id,

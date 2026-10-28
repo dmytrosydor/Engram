@@ -297,7 +297,8 @@ fn import_edges(conn: &Connection, src: &Connection, ids: &HashMap<i64, i64>) ->
     Ok(n)
 }
 
-/// Deleted Memora content is remembered so it does not come back via another source.
+/// Deleted Memora content is recorded in the log (hash, id, reason) for the record;
+/// nothing checks it on insert yet.
 fn import_tombstones(conn: &Connection, src: &Connection) -> Result<()> {
     let mut stmt =
         src.prepare("SELECT content_hash, memory_id, reason, created_at FROM tombstones")?;
@@ -348,6 +349,12 @@ pub fn auto_memory(conn: &Connection, projects: &Path, inventory: &Path) -> Resu
     let tx = conn.unchecked_transaction()?;
     for row in &rows {
         if row.action.starts_with("drop") || row.file == "MEMORY.md" {
+            report.dropped += 1;
+            continue;
+        }
+        // manifest names are folder and file names, never paths
+        let plain = |n: &str| !n.is_empty() && !n.contains('/') && n != ".." && n != ".";
+        if !plain(&row.claude_project_dir) || !plain(&row.file) {
             report.dropped += 1;
             continue;
         }

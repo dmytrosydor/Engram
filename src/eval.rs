@@ -45,7 +45,11 @@ pub fn extract(projects: &Path, out: &Path) -> Result<usize> {
         };
         for f in files.flatten() {
             if f.path().extension().is_some_and(|e| e == "jsonl") {
-                for p in from_transcript(&f.path())? {
+                let Ok(found) = from_transcript(&f.path()) else {
+                    eprintln!("skipping unreadable {}", f.path().display());
+                    continue;
+                };
+                for p in found {
                     pairs
                         .entry(p.query.clone())
                         .and_modify(|e| e.memora_ids.extend(&p.memora_ids))

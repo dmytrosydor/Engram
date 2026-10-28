@@ -70,6 +70,7 @@ fn put(
         mode: Some("add"),
         vector: v.as_deref(),
         visible: &vis,
+        status: "active",
     };
     match memory::write(conn, &w, "test").unwrap() {
         Written::Created(id) => id,
@@ -174,9 +175,10 @@ fn daily_pass_end_to_end_with_a_fake_model() {
         status(&conn, p1),
         ("archived".into(), "event".into(), "work/acme".into())
     );
+    // the move to global waits for a person
     assert_eq!(
         status(&conn, p2),
-        ("active".into(), "lesson".into(), "global".into())
+        ("active".into(), "lesson".into(), "work/acme".into())
     );
     assert_eq!((r.pairs_queued, r.transcripts, r.notes), (1, 1, 1));
     // one valid item per extraction (the invalid kind is dropped): transcript + note
@@ -194,6 +196,9 @@ fn daily_pass_end_to_end_with_a_fake_model() {
 
     // accepting the merge supersedes the duplicate; the new proposal becomes an item
     let open = review::list(&conn, "open", 10).unwrap();
+    let mv = open.iter().find(|e| e.op == "move").unwrap();
+    review::accept(&conn, mv.id, None, "test").unwrap();
+    assert_eq!(status(&conn, p2).2, "global");
     let merge = open.iter().find(|e| e.op == "merge").unwrap();
     review::accept(&conn, merge.id, None, "test").unwrap();
     assert_eq!(status(&conn, b).0, "superseded");
@@ -222,4 +227,62 @@ fn daily_pass_end_to_end_with_a_fake_model() {
     );
     assert_eq!(fake.asked.borrow().len(), asked_before);
     assert!(daily::not_due(&conn).unwrap().is_some());
+}
+
+#[test]
+fn bad_transcripts_are_skipped_and_the_rest_wait_for_the_next_run() {
+    unsafe {
+        std::env::set_var("ENGRAM_EMBED_SOCK", "/nonexistent/engram-test.sock");
+        std::env::set_var("ENGRAM_LLAMA_SERVER", "/usr/bin/false");
+    }
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("engram.db");
+    db::init(&path).unwrap();
+    let conn = db::connect(&path).unwrap();
+    std::fs::write(dir.path().join("spaces.toml"), SPACES).unwrap();
+    spaces::load(&conn, &dir.path().join("spaces.toml")).unwrap();
+
+    let proj = dir.path().join("projects/-code-acme");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(proj.join("0-broken.jsonl"), [0xff, 0xfe, b'\n', 0xff]).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    transcript(dir.path()); // s1.jsonl, newer
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let s2 = std::fs::read_to_string(proj.join("s1.jsonl"))
+        .unwrap()
+        .replace("stand", "box");
+    std::fs::write(proj.join("s2.jsonl"), s2).unwrap();
+    std::fs::create_dir_all(dir.path().join("inbox")).unwrap();
+    std::fs::write(dir.path().join("inbox/bin.md"), [0xff, b'x']).unwrap();
+
+    let fake = Fake {
+        asked: RefCell::new(Vec::new()),
+        classify: "[]".into(),
+    };
+    let opts = Options {
+        classify: 0,
+        transcripts: 2,
+        pairs: 0,
+        projects: dir.path().join("projects"),
+        inbox_dir: dir.path().join("inbox"),
+        exclude: vec![],
+    };
+    let r = daily::run(&conn, &fake, &opts, |_| {}).unwrap();
+    // the broken file is reported, s1 is read, s2 is left for the next run
+    assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
+    assert_eq!(
+        (r.transcripts, r.notes),
+        (1, 1),
+        "non-UTF-8 note is stored lossily"
+    );
+    assert!(dir.path().join("inbox/processed/bin.md").exists());
+
+    conn.execute("DELETE FROM meta WHERE key = 'daily_last_run'", [])
+        .unwrap();
+    let next = daily::run(&conn, &fake, &opts, |_| {}).unwrap();
+    assert_eq!(
+        (next.transcripts, next.errors.len()),
+        (1, 0),
+        "s2 picked up, nothing repeated"
+    );
 }

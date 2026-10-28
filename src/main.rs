@@ -250,7 +250,7 @@ fn main() -> Result<ExitCode> {
         }
         Cmd::Get { ids } => {
             let conn = open()?;
-            println!("{}", memory::get(&conn, &ids, "cli")?);
+            println!("{}", memory::get(&conn, &ids, "cli", None)?);
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Core { dir, all } => {
