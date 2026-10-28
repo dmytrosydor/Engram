@@ -158,6 +158,13 @@ impl Server {
             },
             &self.session,
         )?;
+        if !matches!(
+            written,
+            memory::Written::Similar(_) | memory::Written::Exists(_)
+        ) {
+            // cores are cheap to rebuild; keep this session's one current
+            crate::core::rebuild(&conn, a.space.as_deref().unwrap_or(&self.space))?;
+        }
         Ok(written.message())
     }
 }

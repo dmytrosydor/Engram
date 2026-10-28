@@ -3,7 +3,7 @@ use std::process::ExitCode;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use engram::{db, embed, import, index, memory, spaces};
+use engram::{core, db, embed, import, index, memory, spaces};
 
 #[derive(Parser)]
 #[command(
@@ -51,6 +51,22 @@ enum Cmd {
     },
     /// Print items in full
     Get { ids: Vec<i64> },
+    /// Print the core a session in this folder would get (rebuilt first)
+    Core {
+        dir: Option<PathBuf>,
+        /// Rebuild every space and print sizes instead
+        #[arg(long)]
+        all: bool,
+    },
+    /// Claude Code hook entry points (read the hook JSON on stdin)
+    #[command(subcommand)]
+    Hook(HookCmd),
+}
+
+#[derive(Subcommand)]
+enum HookCmd {
+    /// Print the space core
+    SessionStart,
 }
 
 #[derive(Subcommand)]
@@ -155,6 +171,33 @@ fn main() -> Result<ExitCode> {
         Cmd::Get { ids } => {
             let conn = open()?;
             println!("{}", memory::get(&conn, &ids, "cli")?);
+            Ok(ExitCode::SUCCESS)
+        }
+        Cmd::Core { dir, all } => {
+            let conn = open()?;
+            if all {
+                for (space, chars) in core::rebuild_all(&conn)? {
+                    println!("{space:<24} {chars:>5} chars");
+                }
+                return Ok(ExitCode::SUCCESS);
+            }
+            let dir = match dir {
+                Some(d) => d,
+                None => std::env::current_dir()?,
+            };
+            let space = spaces::resolve(&conn, &dir)?;
+            core::rebuild(&conn, &space)?;
+            let text = core::get(&conn, &space)?;
+            println!("{text}");
+            eprintln!(
+                "[{space}] {} chars, ~{} tokens",
+                text.chars().count(),
+                core::estimate_tokens(&text)
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        Cmd::Hook(HookCmd::SessionStart) => {
+            engram::hook::session_start();
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Reindex => {
