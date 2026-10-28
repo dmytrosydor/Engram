@@ -21,13 +21,33 @@ enum Cmd {
     Init,
     /// Show versions and tables
     Info,
+    /// Embed texts and print timing and pairwise cosine (starts llama-server if needed)
+    Embed { texts: Vec<String> },
 }
 
 fn main() -> Result<ExitCode> {
     match Cli::parse().cmd {
         Cmd::Init => init(),
         Cmd::Info => info(),
+        Cmd::Embed { texts } => embed(&texts),
     }
+}
+
+fn embed(texts: &[String]) -> Result<ExitCode> {
+    let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+    let started = std::time::Instant::now();
+    let vecs = engram::embed::embed(&refs)?;
+    println!(
+        "{} vectors x {} in {:?}",
+        vecs.len(),
+        engram::embed::DIM,
+        started.elapsed()
+    );
+    for i in 1..vecs.len() {
+        let cos = engram::embed::cosine(&vecs[0], &vecs[i]);
+        println!("cos(0,{i}) = {cos:.4}");
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn init() -> Result<ExitCode> {
