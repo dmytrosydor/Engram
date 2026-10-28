@@ -6,9 +6,9 @@ use engram::embed;
 #[ignore]
 fn similar_texts_are_closer() {
     let v = embed::embed(&[
-        "zsh не ділить $VAR на слова",
-        "в zsh змінна не розбивається на слова",
-        "рецепт борщу",
+        "zsh does not split $VAR into words",
+        "in zsh a variable is not broken into words",
+        "a borscht recipe",
     ])
     .unwrap();
     assert!(v.iter().all(|x| x.len() == embed::DIM));

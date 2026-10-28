@@ -1,14 +1,14 @@
 # Engram
 
-Локальна довготривала пам'ять для Claude Code. Один бінарник на Rust, один файл SQLite (FTS5 + `sqlite-vec`) і локальна модель векторів bge-m3 через llama.cpp на Metal.
+Local long-term memory for Claude Code. One Rust binary, one SQLite file (FTS5 + `sqlite-vec`) and a local bge-m3 embedding model served by llama.cpp on Metal.
 
-- **Ядро на старті сесії.** Хук `SessionStart` за ~1 мс додає коротке ядро простору поточної папки (≤ 6 000 символів): правила, поточний стан, свіжі рішення, те, що найчастіше відкривається.
-- **Три інструменти MCP:** `search` (за словами + за змістом, з урахуванням простору), `get`, `write` (не пише майже-дублі, поки не вибрано режим).
-- **Простори.** `work/…` і `personal/…` визначаються за папкою; робота не бачить особистого, і навпаки. `global` видно всюди.
-- **Щоденний розбір.** Раз на день (на живленні) прострочений стан іде в архів, майже-дублі й нові знання з транскриптів потрапляють у чергу, неперевірений імпорт класифікується. Модель — ізольований `claude -p` без інструментів.
-- **Веб-інтерфейс** на `127.0.0.1:7777`: що отримає Claude, черга, стрічка, карта, журнал видач, здоров'я.
+- **A core at session start.** A `SessionStart` hook adds, in about 1 ms, a short core for the space of the current folder (≤ 6,000 characters): rules, current state, recent decisions and what gets opened most.
+- **Three MCP tools:** `search` (by words and by meaning, scoped to the space), `get`, and `write` (refuses near-duplicates until you pick a mode).
+- **Spaces.** `work/…` and `personal/…` are resolved from the folder; work never sees personal records and vice versa. `global` is visible everywhere.
+- **Daily pass.** Once a day (on AC power) expired state is archived, near-duplicates and new knowledge from transcripts go to a review queue, and unreviewed imports are classified. The model is an isolated `claude -p` with no tools.
+- **Web UI** on `127.0.0.1:7777`: what Claude gets, the queue, a feed, a map, the recall log and health.
 
-## Встановлення
+## Install
 
 ```sh
 brew install rust llama.cpp
@@ -18,7 +18,7 @@ curl -L -o ~/.engram/models/bge-m3-Q8_0.gguf \
   https://huggingface.co/gpustack/bge-m3-GGUF/resolve/main/bge-m3-Q8_0.gguf
 ```
 
-Простори й правила «папка → простір» — у `~/.engram/spaces.toml`:
+Spaces and folder → space rules live in `~/.engram/spaces.toml`:
 
 ```toml
 [spaces]
@@ -32,15 +32,15 @@ curl -L -o ~/.engram/models/bge-m3-Q8_0.gguf \
 
 ```sh
 engram spaces ~/.engram/spaces.toml
-engram install          # показує план
-engram install --yes    # хук SessionStart, MCP-сервер, launchd-агент щоденного розбору
+engram install          # shows the plan
+engram install --yes    # SessionStart hook, MCP server, launchd agent for the daily pass
 ```
 
-`engram uninstall --yes` прибирає все це; дані в `~/.engram` лишаються.
+`engram uninstall --yes` removes all of that; the data in `~/.engram` stays.
 
-## Імпорт (необов'язково)
+## Import (optional)
 
-З Memora і auto-memory Claude Code; джерела лише читаються. Класифікація — CSV-маніфести (один рядок на запис); записи без рядка йдуть в `personal/_inbox` як неперевірені.
+From Memora and Claude Code auto-memory; the sources are only read. Classification comes from CSV manifests (one row per record); records without a row go to `personal/_inbox` as unreviewed.
 
 ```sh
 engram import memora --manifest memora-manifest.csv
@@ -48,22 +48,22 @@ engram import auto-memory --inventory auto-memory-inventory.csv
 engram reindex
 ```
 
-## Щодня
+## Day to day
 
 ```sh
 engram ui                      # http://127.0.0.1:7777
-engram search "запит" --dir ~/code/acme
-engram add "нотатка для наступного розбору"
+engram search "query" --dir ~/code/acme
+engram add "a note for the next daily pass"
 engram review list | accept <id> | reject <id>
-engram daily                   # вручну, не чекаючи launchd
-engram eval extract && engram eval run   # якість пошуку на власній історії
+engram daily                   # run now instead of waiting for launchd
+engram eval extract && engram eval run   # search quality on your own history
 ```
 
-Тека даних — `~/.engram` (або `ENGRAM_HOME`); модель і її сокет завжди в `~/.engram`.
+The data folder is `~/.engram` (or `ENGRAM_HOME`); the model and its socket always live in `~/.engram`.
 
-## Розробка
+## Development
 
 ```sh
-cargo test                     # без моделі
-cargo test -- --include-ignored   # з моделлю в ~/.engram/models
+cargo test                     # no model needed
+cargo test -- --include-ignored   # with the model in ~/.engram/models
 ```

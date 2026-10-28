@@ -96,12 +96,12 @@ async fn page(
 
 fn layout(title: &str, body: &str) -> String {
     let nav = [
-        ("/", "Що отримає Claude"),
-        ("/queue", "Черга"),
-        ("/feed", "Стрічка"),
-        ("/map", "Карта"),
-        ("/recall", "Журнал видач"),
-        ("/health", "Здоров'я"),
+        ("/", "What Claude gets"),
+        ("/queue", "Queue"),
+        ("/feed", "Feed"),
+        ("/map", "Map"),
+        ("/recall", "Recall log"),
+        ("/health", "Health"),
     ]
     .iter()
     .map(|(href, name)| {
@@ -111,7 +111,7 @@ fn layout(title: &str, body: &str) -> String {
     .collect::<Vec<_>>()
     .join("");
     format!(
-        "<!doctype html><html lang=uk><head><meta charset=utf-8>\
+        "<!doctype html><html lang=en><head><meta charset=utf-8>\
          <meta name=viewport content='width=device-width,initial-scale=1'>\
          <title>{t} · engram</title><style>{CSS}</style>\
          <script src='https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js'></script></head>\
@@ -169,16 +169,16 @@ async fn claude_view(Query(p): Query<DirQ>) -> Html<String> {
         .unwrap_or_else(|| std::env::var("HOME").unwrap_or_default());
     let body = format!(
         "<form class=form hx-get=/core hx-target=#core hx-trigger='load, submit' hx-include='[name=dir]'>\
-         <label>Папка сесії<input type=text name=dir value='{d}'></label><button>Показати ядро</button></form>\
+         <label>Session folder<input type=text name=dir value='{d}'></label><button>Show core</button></form>\
          <div id=core></div>\
-         <h2>Пошук, як його бачить Claude</h2>\
+         <h2>Search as Claude sees it</h2>\
          <form class=form hx-get=/search hx-target=#hits hx-include='[name=dir]'>\
-         <label>Запит<input type=text name=q placeholder='наприклад: git identity'></label>\
+         <label>Query<input type=text name=q placeholder='e.g. git identity'></label>\
          <select name=scope><option>project</option><option>all</option><option>archive</option></select>\
-         <button>Шукати</button></form><div id=hits></div>",
+         <button>Search</button></form><div id=hits></div>",
         d = esc(&dir)
     );
-    Html(layout("Що отримає Claude", &body))
+    Html(layout("What Claude gets", &body))
 }
 
 async fn core_fragment(Query(p): Query<DirQ>) -> Html<String> {
@@ -188,7 +188,7 @@ async fn core_fragment(Query(p): Query<DirQ>) -> Html<String> {
         core::rebuild(conn, &space)?;
         let text = core::get(conn, &space)?;
         Ok(format!(
-            "<p class=meta>простір <b>{}</b> · бачить {} · {} символів · ~{} токенів</p><pre>{}</pre>",
+            "<p class=meta>space <b>{}</b> · sees {} · {} chars · ~{} tokens</p><pre>{}</pre>",
             esc(&space),
             esc(&spaces::visible(conn, &space)?.join(", ")),
             text.chars().count(),
@@ -226,11 +226,11 @@ async fn search_fragment(Query(p): Query<SearchQ>) -> Html<String> {
             },
         )?;
         let mut out = format!(
-            "<p class=meta>{} результатів за {:?}{}</p>",
+            "<p class=meta>{} results in {:?}{}</p>",
             hits.len(),
             started.elapsed(),
             if vector.is_none() {
-                " · лише за словами (модель недоступна)"
+                " · words only (model unavailable)"
             } else {
                 ""
             }
@@ -246,12 +246,12 @@ async fn search_fragment(Query(p): Query<SearchQ>) -> Html<String> {
 // ---------- 2. review queue ----------
 
 async fn queue() -> Html<String> {
-    page("Черга", |conn| {
+    page("Queue", |conn| {
         let open = review::list(conn, "open", 200)?;
         if open.is_empty() {
-            return Ok("<p class=meta>Черга порожня.</p>".into());
+            return Ok("<p class=meta>Queue is empty.</p>".into());
         }
-        let mut out = format!("<p class=meta>{} пропозицій</p>", open.len());
+        let mut out = format!("<p class=meta>{} proposals</p>", open.len());
         for e in open {
             // one broken proposal must not hide the rest of the queue
             match review_card(conn, &e) {
@@ -259,7 +259,7 @@ async fn queue() -> Html<String> {
                 Err(err) => write!(
                     out,
                     "<div class=row id=r{id}><p class=err>R{id}: {}</p><div class=acts>\
-                     <button class=bad hx-post=/review/{id}/reject hx-target=#r{id} hx-swap=outerHTML>Відхилити</button></div></div>",
+                     <button class=bad hx-post=/review/{id}/reject hx-target=#r{id} hx-swap=outerHTML>Reject</button></div></div>",
                     esc(&format!("{err:#}")),
                     id = e.id
                 )?,
@@ -292,11 +292,11 @@ fn review_card(conn: &Connection, e: &review::Entry) -> Result<String> {
             write!(
                 out,
                 "<form hx-post=/review/{id}/edit hx-target=#r{id} hx-swap=outerHTML>\
-                 <div class=form><label>Заголовок<input type=text name=title value='{t}'></label>\
-                 <select name=kind>{kinds}</select><label>Простір<input type=text name=space value='{s}'></label></div>\
+                 <div class=form><label>Title<input type=text name=title value='{t}'></label>\
+                 <select name=kind>{kinds}</select><label>Space<input type=text name=space value='{s}'></label></div>\
                  <textarea name=body>{b}</textarea>\
-                 <div class=acts><button class=ok>Так (з правками)</button>\
-                 <button class=bad hx-post=/review/{id}/reject hx-target=#r{id} hx-swap=outerHTML>Ні</button></div></form>",
+                 <div class=acts><button class=ok>Yes (with edits)</button>\
+                 <button class=bad hx-post=/review/{id}/reject hx-target=#r{id} hx-swap=outerHTML>No</button></div></form>",
                 t = esc(&p.title),
                 s = esc(&p.space),
                 b = esc(&p.body)
@@ -307,9 +307,9 @@ fn review_card(conn: &Connection, e: &review::Entry) -> Result<String> {
             let drop = e.proposal["drop"].as_i64().unwrap_or(0);
             write!(
                 out,
-                "<div>лишити {}</div><div>замінити ним {}</div>\
-                 <div class=acts><button class=ok hx-post=/review/{id}/accept hx-target=#r{id} hx-swap=outerHTML>Так, злити</button>\
-                 <button class=bad hx-post=/review/{id}/reject hx-target=#r{id} hx-swap=outerHTML>Ні, різні</button></div>",
+                "<div>keep {}</div><div>and fold into it {}</div>\
+                 <div class=acts><button class=ok hx-post=/review/{id}/accept hx-target=#r{id} hx-swap=outerHTML>Yes, merge</button>\
+                 <button class=bad hx-post=/review/{id}/reject hx-target=#r{id} hx-swap=outerHTML>No, different</button></div>",
                 brief(conn, keep)?,
                 brief(conn, drop)?
             )?;
@@ -318,17 +318,17 @@ fn review_card(conn: &Connection, e: &review::Entry) -> Result<String> {
             let item = e.item_ids.first().copied().unwrap_or(0);
             let what = if e.op == "move" {
                 format!(
-                    "перенести в <b>{}</b>",
+                    "move to <b>{}</b>",
                     esc(e.proposal["space"].as_str().unwrap_or("?"))
                 )
             } else {
-                "зробити активним (з'явиться в ядрах)".to_string()
+                "make active (will appear in cores)".to_string()
             };
             write!(
                 out,
                 "<div>{what}: {}</div>\
-                 <div class=acts><button class=ok hx-post=/review/{id}/accept hx-target=#r{id} hx-swap=outerHTML>Так</button>\
-                 <button class=bad hx-post=/review/{id}/reject hx-target=#r{id} hx-swap=outerHTML>Ні</button></div>",
+                 <div class=acts><button class=ok hx-post=/review/{id}/accept hx-target=#r{id} hx-swap=outerHTML>Yes</button>\
+                 <button class=bad hx-post=/review/{id}/reject hx-target=#r{id} hx-swap=outerHTML>No</button></div>",
                 brief(conn, item)?
             )?;
         }
@@ -357,7 +357,7 @@ fn brief(conn: &Connection, id: i64) -> Result<String> {
             esc(&title),
             esc(&store::clip(&body, 300))
         ),
-        None => format!("#{id} (немає)"),
+        None => format!("#{id} (missing)"),
     })
 }
 
@@ -374,7 +374,7 @@ async fn review_accept(Path(id): Path<i64>) -> Html<String> {
 async fn review_reject(Path(id): Path<i64>) -> Html<String> {
     blocking(move |conn| {
         review::reject(conn, id)?;
-        Ok(format!("<div class=row class=meta>R{id}: відхилено</div>"))
+        Ok(format!("<div class=row class=meta>R{id}: rejected</div>"))
     })
     .await
 }
@@ -415,14 +415,14 @@ struct FeedQ {
 
 async fn feed(Query(p): Query<FeedQ>) -> Html<String> {
     let days = p.days.unwrap_or(2).clamp(1, 90);
-    page("Стрічка", move |conn| {
+    page("Feed", move |conn| {
         let mut stmt = conn.prepare(
             "SELECT id FROM item WHERE julianday('now') - julianday(COALESCE(updated_at, created_at)) <= ?1
              ORDER BY COALESCE(updated_at, created_at) DESC LIMIT 300",
         )?;
         let ids: Vec<i64> = stmt.query_map([days], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
         let mut out = format!(
-            "<p class=meta>{} записів за {days} дн. · <a href='/feed?days=1'>1</a> · <a href='/feed?days=7'>7</a> · <a href='/feed?days=30'>30</a></p>",
+            "<p class=meta>{} records in {days} d · <a href='/feed?days=1'>1</a> · <a href='/feed?days=7'>7</a> · <a href='/feed?days=30'>30</a></p>",
             ids.len()
         );
         for id in ids {
@@ -441,21 +441,21 @@ fn item_card(conn: &Connection, id: i64) -> Result<String> {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)),
         )?;
     let pin = if pinned == 1 {
-        ("unpin", "Відкріпити")
+        ("unpin", "Unpin")
     } else {
-        ("pin", "Закріпити")
+        ("pin", "Pin")
     };
     let life = if status == "archived" || status == "superseded" {
-        ("restore", "Повернути")
+        ("restore", "Restore")
     } else {
-        ("archive", "В архів")
+        ("archive", "Archive")
     };
     Ok(format!(
         "<div class=row id=i{id}><div class=meta><a href='/item/{id}'>#{id}</a> · {kind} · {space} · {status}{p} · {created} · {src}</div>\
          <b>{title}</b><div>{body}</div><div class=acts>\
          <button hx-post=/item/{id}/{pa} hx-target=#i{id} hx-swap=outerHTML>{pl}</button>\
          <button hx-post=/item/{id}/{la} hx-target=#i{id} hx-swap=outerHTML>{ll}</button>\
-         <a href='/item/{id}'>правити</a></div></div>",
+         <a href='/item/{id}'>edit</a></div></div>",
         kind = esc(&kind),
         space = esc(&space),
         status = esc(&status),
@@ -499,7 +499,7 @@ async fn item_action(Path((id, action)): Path<(i64, String)>) -> Html<String> {
 }
 
 async fn item_page(Path(id): Path<i64>) -> Html<String> {
-    page("Запис", move |conn| {
+    page("Record", move |conn| {
         let (space, kind, title, body): (String, String, String, String) = conn.query_row(
             "SELECT space_id, kind, title, body FROM item WHERE id = ?1",
             [id],
@@ -516,19 +516,19 @@ async fn item_page(Path(id): Path<i64>) -> Html<String> {
         let mut out = item_card(conn, id)?;
         write!(
             out,
-            "<h2>Правити</h2><form hx-post=/item/{id}/edit hx-target=#saved>\
-             <div class=form><label>Заголовок<input type=text name=title value='{t}'></label>\
+            "<h2>Edit</h2><form hx-post=/item/{id}/edit hx-target=#saved>\
+             <div class=form><label>Title<input type=text name=title value='{t}'></label>\
              <select name=kind>{kinds}</select><select name=space>{spaces_opts}</select></div>\
-             <textarea name=body rows=10>{b}</textarea><div class=acts><button class=ok>Зберегти</button></div></form><div id=saved></div>",
+             <textarea name=body rows=10>{b}</textarea><div class=acts><button class=ok>Save</button></div></form><div id=saved></div>",
             t = esc(&title),
             b = esc(&body)
         )?;
         // memory::get would count this view as a hit; the UI must not skew that signal
         let links = memory::links(conn, id)?;
         if !links.is_empty() {
-            write!(out, "<h2>Зв'язки</h2><p>{}</p>", esc(&links.join(", ")))?;
+            write!(out, "<h2>Links</h2><p>{}</p>", esc(&links.join(", ")))?;
         }
-        out.push_str("<h2>Історія</h2><table><tr><th>коли</th><th>хто</th><th>що</th></tr>");
+        out.push_str("<h2>History</h2><table><tr><th>when</th><th>who</th><th>what</th></tr>");
         let mut stmt = conn.prepare("SELECT at, actor, op FROM log WHERE item_id = ?1 ORDER BY id DESC LIMIT 50")?;
         for row in stmt.query_map([id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))? {
             let (at, actor, op) = row?;
@@ -550,7 +550,7 @@ async fn item_edit(Path(id): Path<i64>, Form(f): Form<Edited>) -> Html<String> {
             || body.chars().count() > store::BODY_MAX
         {
             anyhow::bail!(
-                "заголовок 1–{} символів, текст 1–{} символів",
+                "title must be 1–{} chars, body 1–{} chars",
                 store::TITLE_MAX,
                 store::BODY_MAX
             );
@@ -563,14 +563,14 @@ async fn item_edit(Path(id): Path<i64>, Form(f): Form<Edited>) -> Html<String> {
         let note = if changed {
             match index::reembed_item(conn, id) {
                 Ok(()) => "",
-                Err(_) => " (вектор порахується в наступному reindex)",
+                Err(_) => " (the vector will be computed on the next reindex)",
             }
         } else {
             ""
         };
         core::rebuild(conn, &old_space)?;
         core::rebuild(conn, &f.space)?;
-        Ok(format!("<p class=meta>Збережено{note}.</p>"))
+        Ok(format!("<p class=meta>Saved{note}.</p>"))
     })
     .await
 }
@@ -578,7 +578,7 @@ async fn item_edit(Path(id): Path<i64>, Form(f): Form<Edited>) -> Html<String> {
 // ---------- 4. map ----------
 
 async fn map() -> Html<String> {
-    page("Карта", |conn| {
+    page("Map", |conn| {
         let mut out = String::from("<div class=grid>");
         let mut stmt = conn.prepare(
             "SELECT s.id, s.domain, COALESCE(s.core_tokens, 0),
@@ -599,16 +599,16 @@ async fn map() -> Html<String> {
             let (id, domain, tokens, active, proposed, retired) = row?;
             write!(
                 out,
-                "<div class=row><b>{}</b><div class=meta>{} · ядро ~{tokens} ток.</div>\
-                 <div>{active} активних · {proposed} неперевірених · {retired} в архіві</div>\
-                 <div class=acts><button data-space='{}' onclick=\"show(this.dataset.space)\">граф</button></div></div>",
+                "<div class=row><b>{}</b><div class=meta>{} · core ~{tokens} tokens</div>\
+                 <div>{active} active · {proposed} unreviewed · {retired} archived</div>\
+                 <div class=acts><button data-space='{}' onclick=\"show(this.dataset.space)\">graph</button></div></div>",
                 esc(&id),
                 esc(&domain),
                 esc(&id)
             )?;
         }
         out.push_str(
-            "</div><h2>Підтверджені зв'язки</h2><div id=graph></div>\
+            "</div><h2>Confirmed links</h2><div id=graph></div>\
              <script src='https://unpkg.com/cytoscape@3.30.2/dist/cytoscape.min.js'></script>\
              <script>
              function show(space){fetch('/graph?space='+encodeURIComponent(space)).then(r=>r.json()).then(g=>{
@@ -666,8 +666,8 @@ async fn graph(Query(p): Query<SpaceQ>) -> Json<serde_json::Value> {
 // ---------- 5. recall log ----------
 
 async fn recall() -> Html<String> {
-    page("Журнал видач", |conn| {
-        let mut out = String::from("<table><tr><th>коли</th><th>простір</th><th>запит</th><th>видано</th><th>відкрито</th></tr>");
+    page("Recall log", |conn| {
+        let mut out = String::from("<table><tr><th>when</th><th>space</th><th>query</th><th>returned</th><th>opened</th></tr>");
         let mut stmt = conn.prepare(
             "SELECT at, space_id, query, item_ids, COALESCE(opened, '[]') FROM recall ORDER BY id DESC LIMIT 100",
         )?;
@@ -702,8 +702,8 @@ async fn recall() -> Html<String> {
         )?;
         write!(
             out,
-            "<h2>Ніколи не відкривались</h2><p class=meta>{never} з {total} активних записів старші 30 днів і жодного разу не відкриті \
-             — кандидати в архів. Найстаріші:</p>"
+            "<h2>Never opened</h2><p class=meta>{never} of {total} active records are older than 30 days and were never opened \
+             — archive candidates. Oldest:</p>"
         )?;
         let mut stmt = conn.prepare(
             "SELECT id, kind, space_id, status, created_at, title FROM item
@@ -731,34 +731,34 @@ async fn recall() -> Html<String> {
 // ---------- 6. health ----------
 
 async fn health() -> Html<String> {
-    page("Здоров'я", |conn| {
+    page("Health", |conn| {
         let n = |sql: &str| -> Result<i64> { Ok(conn.query_row(sql, [], |r| r.get(0))?) };
         let rows = [
             (
-                "Прострочений стан (ще активний)",
+                "Expired state (still active)",
                 n("SELECT count(*) FROM item WHERE kind IN ('state','task') AND status IN ('active','proposed')
                    AND valid_until IS NOT NULL AND valid_until < date('now')")?,
             ),
-            ("Пропозицій у черзі", n("SELECT count(*) FROM review WHERE status = 'open'")?),
-            ("Неперевірених записів (proposed)", n("SELECT count(*) FROM item WHERE status = 'proposed'")?),
-            ("Записів без вектора", n("SELECT count(*) FROM item WHERE id NOT IN (SELECT item_id FROM item_vec)")?),
-            ("Тексти довші за 1500 символів", n("SELECT count(*) FROM item WHERE status IN ('active','proposed') AND length(body) > 1500")?),
-            ("Теги поза словником", n("SELECT count(*) FROM tag WHERE tag NOT IN (SELECT tag FROM tag_vocab)")?),
-            ("Нерозібраних нотаток в inbox", n("SELECT count(*) FROM inbox WHERE processed_at IS NULL")?),
+            ("Proposals in queue", n("SELECT count(*) FROM review WHERE status = 'open'")?),
+            ("Unreviewed records (proposed)", n("SELECT count(*) FROM item WHERE status = 'proposed'")?),
+            ("Records without a vector", n("SELECT count(*) FROM item WHERE id NOT IN (SELECT item_id FROM item_vec)")?),
+            ("Bodies longer than 1500 chars", n("SELECT count(*) FROM item WHERE status IN ('active','proposed') AND length(body) > 1500")?),
+            ("Tags outside the vocabulary", n("SELECT count(*) FROM tag WHERE tag NOT IN (SELECT tag FROM tag_vocab)")?),
+            ("Unprocessed inbox notes", n("SELECT count(*) FROM inbox WHERE processed_at IS NULL")?),
         ];
         let mut out = String::from("<table>");
         for (name, v) in rows {
             write!(out, "<tr><td>{name}</td><td><b>{v}</b></td></tr>")?;
         }
-        let last = daily::meta(conn, "daily_last_run")?.unwrap_or_else(|| "ще не було".into());
+        let last = daily::meta(conn, "daily_last_run")?.unwrap_or_else(|| "never".into());
         write!(
             out,
-            "<tr><td>Останній щоденний розбір</td><td><b>{}</b></td></tr>\
-             <tr><td>Модель векторів</td><td><b>{}</b></td></tr></table>",
+            "<tr><td>Last daily pass</td><td><b>{}</b></td></tr>\
+             <tr><td>Embedding model</td><td><b>{}</b></td></tr></table>",
             esc(&last),
-            if embed::is_running() { "працює" } else { "зупинена (стартує на запит)" }
+            if embed::is_running() { "running" } else { "stopped (starts on demand)" }
         )?;
-        out.push_str("<h2>Останні дії</h2><table>");
+        out.push_str("<h2>Recent actions</h2><table>");
         let mut stmt = conn.prepare(
             "SELECT at, actor, op, item_id FROM log WHERE op NOT IN ('create', 'tombstone') ORDER BY id DESC LIMIT 30",
         )?;
