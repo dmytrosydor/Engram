@@ -160,7 +160,7 @@ fn start_server() -> Result<()> {
         bail!("model not found at {}", model_path().display());
     }
     let _ = std::fs::remove_file(socket_path()); // stale socket from a dead server
-    Command::new(server_bin())
+    let mut child = Command::new(server_bin())
         .args(server_args())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -173,6 +173,9 @@ fn start_server() -> Result<()> {
     while started.elapsed() < START_TIMEOUT {
         if is_running() {
             return Ok(());
+        }
+        if let Some(status) = child.try_wait()? {
+            bail!("llama-server exited during start ({status})");
         }
         std::thread::sleep(Duration::from_millis(100));
     }

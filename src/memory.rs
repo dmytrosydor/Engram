@@ -487,7 +487,8 @@ fn set_vector(conn: &Connection, id: i64, v: Option<&[f32]>) -> Result<()> {
     Ok(())
 }
 
-fn similar(conn: &Connection, v: &[f32], spaces: &[String]) -> Result<Vec<(Hit, f32)>> {
+/// Visible live items with cosine >= SIMILAR to `v`, best first.
+pub fn similar(conn: &Connection, v: &[f32], spaces: &[String]) -> Result<Vec<(Hit, f32)>> {
     let q = Query {
         text: "",
         vector: Some(v),

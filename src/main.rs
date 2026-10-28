@@ -3,7 +3,7 @@ use std::process::ExitCode;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use engram::{core, db, embed, import, index, memory, spaces};
+use engram::{core, daily, db, embed, import, index, memory, review, spaces};
 
 #[derive(Parser)]
 #[command(
@@ -58,9 +58,49 @@ enum Cmd {
         #[arg(long)]
         all: bool,
     },
+    /// Daily pass: expire state, queue merges, classify imports, read new transcripts
+    Daily {
+        /// Exit quietly unless the scheduled run is due (once a day, on AC power)
+        #[arg(long)]
+        if_due: bool,
+        /// Unreviewed imported items to classify
+        #[arg(long, default_value_t = 120)]
+        classify: usize,
+        /// Changed transcripts to read
+        #[arg(long, default_value_t = 8)]
+        transcripts: usize,
+        /// Near-duplicate pairs to judge
+        #[arg(long, default_value_t = 40)]
+        pairs: usize,
+    },
+    /// Drop a note into the inbox for the next daily pass
+    Add {
+        text: String,
+        /// Space for the note (default: the current folder's)
+        #[arg(long)]
+        space: Option<String>,
+    },
+    /// The review queue
+    #[command(subcommand)]
+    Review(ReviewCmd),
     /// Claude Code hook entry points (read the hook JSON on stdin)
     #[command(subcommand)]
     Hook(HookCmd),
+}
+
+#[derive(Subcommand)]
+enum ReviewCmd {
+    /// Open proposals
+    List {
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    Accept {
+        ids: Vec<i64>,
+    },
+    Reject {
+        ids: Vec<i64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -194,6 +234,81 @@ fn main() -> Result<ExitCode> {
                 text.chars().count(),
                 core::estimate_tokens(&text)
             );
+            Ok(ExitCode::SUCCESS)
+        }
+        Cmd::Daily {
+            if_due,
+            classify,
+            transcripts,
+            pairs,
+        } => {
+            let conn = open()?;
+            if if_due && let Some(why) = daily::not_due(&conn)? {
+                eprintln!("daily: skipped ({why})");
+                return Ok(ExitCode::SUCCESS);
+            }
+            let home = std::env::var("HOME").unwrap_or_default();
+            let workdir = db::home().join("daily");
+            let projects = PathBuf::from(format!("{home}/.claude/projects"));
+            // the daily pass's own sessions are not persisted, but never read them anyway
+            let own = projects.join(workdir.to_string_lossy().replace(['/', '.'], "-"));
+            let llm = daily::ClaudeCli {
+                model: std::env::var("ENGRAM_DAILY_MODEL").unwrap_or_else(|_| "sonnet".into()),
+                workdir,
+            };
+            let opts = daily::Options {
+                classify,
+                transcripts,
+                pairs,
+                projects,
+                inbox_dir: db::home().join("inbox"),
+                exclude: vec![own],
+            };
+            let report = daily::run(&conn, &llm, &opts, |s| eprintln!("daily: {s}"))?;
+            println!("{report:#?}");
+            Ok(if report.errors.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            })
+        }
+        Cmd::Add { text, space } => {
+            let conn = open()?;
+            let space = match space {
+                Some(s) => s,
+                None => spaces::resolve(&conn, &std::env::current_dir()?)?,
+            };
+            let id = daily::add_note(&conn, &space, &text, "note:cli")?;
+            println!("inbox #{id} ({space}); processed by the next daily pass");
+            Ok(ExitCode::SUCCESS)
+        }
+        Cmd::Review(cmd) => {
+            let conn = open()?;
+            match cmd {
+                ReviewCmd::List { limit } => {
+                    for e in review::list(&conn, "open", limit)? {
+                        println!(
+                            "R{} {} {:?} {}  [{}]",
+                            e.id,
+                            e.op,
+                            e.item_ids,
+                            e.proposal,
+                            e.reason.unwrap_or_default()
+                        );
+                    }
+                }
+                ReviewCmd::Accept { ids } => {
+                    for id in ids {
+                        println!("R{id}: {}", review::accept(&conn, id, None, "cli")?);
+                    }
+                }
+                ReviewCmd::Reject { ids } => {
+                    for id in ids {
+                        review::reject(&conn, id)?;
+                        println!("R{id}: rejected");
+                    }
+                }
+            }
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Hook(HookCmd::SessionStart) => {
