@@ -165,9 +165,12 @@ impl Server {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for Server {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            format!("{INSTRUCTIONS} This session's space: {}.", self.space),
-        )
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("engram", env!("CARGO_PKG_VERSION")))
+            .with_instructions(format!(
+                "{INSTRUCTIONS} This session's space: {}.",
+                self.space
+            ))
     }
 }
 
