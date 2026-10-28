@@ -16,8 +16,6 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::db;
-
 pub const DIM: usize = 1024;
 pub const MODEL_FILE: &str = "bge-m3-Q8_0.gguf";
 const IDLE_SECONDS: u32 = 600;
@@ -25,12 +23,23 @@ const START_TIMEOUT: Duration = Duration::from_secs(60);
 /// Longest text sent to the model; items are ≤1500 chars and chunks ≈800 tokens.
 const MAX_CHARS: usize = 6000;
 
+/// The model server is shared by every database on the machine, so it lives in
+/// `~/.engram` even when `ENGRAM_HOME` points elsewhere (e.g. in tests).
+fn runtime_dir() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    home.join(".engram")
+}
+
 pub fn socket_path() -> PathBuf {
-    db::home().join("embed.sock")
+    std::env::var_os("ENGRAM_EMBED_SOCK")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| runtime_dir().join("embed.sock"))
 }
 
 pub fn model_path() -> PathBuf {
-    db::home().join("models").join(MODEL_FILE)
+    runtime_dir().join("models").join(MODEL_FILE)
 }
 
 pub fn server_bin() -> PathBuf {
@@ -82,6 +91,15 @@ pub fn embed(texts: &[&str]) -> Result<Vec<Vec<f32>>> {
             post("/v1/embeddings", &body)?
         }
     };
+    if status != 200 && resp.contains("too large") {
+        // Dense text (code, ids) can exceed the batch even under MAX_CHARS: find the
+        // offender by embedding one at a time, and keep its head, which is enough for search.
+        if texts.len() > 1 {
+            return texts.iter().map(|t| embed_one(t)).collect();
+        }
+        let shorter = truncate(texts[0], texts[0].chars().count().min(MAX_CHARS) / 2);
+        return embed(&[shorter]);
+    }
     if status != 200 {
         bail!("llama-server returned {status}: {}", truncate(&resp, 300));
     }
@@ -132,8 +150,8 @@ pub fn is_running() -> bool {
 
 /// Starts llama-server in its own process group unless another caller already did.
 fn start_server() -> Result<()> {
-    std::fs::create_dir_all(db::home())?;
-    let lock = File::create(db::home().join("embed.lock"))?;
+    std::fs::create_dir_all(runtime_dir())?;
+    let lock = File::create(runtime_dir().join("embed.lock"))?;
     lock.lock()?; // released when `lock` drops
     if is_running() {
         return Ok(());

@@ -31,7 +31,7 @@ fn open() -> (TempDir, Connection) {
     db::init(&path).unwrap();
     let conn = db::connect(&path).unwrap();
     conn.execute(
-        "INSERT INTO space (id, domain) VALUES ('personal/laluk', 'personal')",
+        "INSERT INTO space (id, domain) VALUES ('personal/notes', 'personal')",
         [],
     )
     .unwrap();
@@ -54,7 +54,7 @@ fn insert_item(
 }
 
 fn add_item(conn: &Connection, text: &str) -> i64 {
-    insert_item(conn, "personal/laluk", "fact", text, None).unwrap()
+    insert_item(conn, "personal/notes", "fact", text, None).unwrap()
 }
 
 fn fts(conn: &Connection, table: &str, query: &str) -> Vec<i64> {
@@ -160,13 +160,13 @@ fn vectors_knn_and_cleanup() {
 #[test]
 fn constraints() {
     let (_dir, conn) = open();
-    insert_item(&conn, "personal/laluk", "fact", "x", Some("h1")).unwrap();
+    insert_item(&conn, "personal/notes", "fact", "x", Some("h1")).unwrap();
     assert!(
-        insert_item(&conn, "personal/laluk", "fact", "y", Some("h1")).is_err(),
+        insert_item(&conn, "personal/notes", "fact", "y", Some("h1")).is_err(),
         "duplicate hash"
     );
     assert!(
-        insert_item(&conn, "personal/laluk", "checkpoint", "z", None).is_err(),
+        insert_item(&conn, "personal/notes", "checkpoint", "z", None).is_err(),
         "unknown kind"
     );
     assert!(

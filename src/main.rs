@@ -1,8 +1,9 @@
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use engram::db;
+use engram::{db, embed, import, index, spaces};
 
 #[derive(Parser)]
 #[command(
@@ -19,10 +20,37 @@ struct Cli {
 enum Cmd {
     /// Create the database (safe to re-run)
     Init,
-    /// Show versions and tables
+    /// Show versions, tables and counts
     Info,
     /// Embed texts and print timing and pairwise cosine (starts llama-server if needed)
     Embed { texts: Vec<String> },
+    /// Load spaces and folder rules from a TOML file
+    Spaces { file: PathBuf },
+    /// Print the space a folder maps to (default: current folder)
+    Where { dir: Option<PathBuf> },
+    /// Import from an existing memory store (sources are only read)
+    #[command(subcommand)]
+    Import(ImportCmd),
+    /// Embed items and chunks that have no vector yet
+    Reindex,
+}
+
+#[derive(Subcommand)]
+enum ImportCmd {
+    /// Memora SQLite database
+    Memora {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long, default_value = "~/.local/share/memora/memories.db")]
+        db: String,
+    },
+    /// Claude Code auto-memory folders
+    AutoMemory {
+        #[arg(long)]
+        inventory: PathBuf,
+        #[arg(long, default_value = "~/.claude/projects")]
+        dir: String,
+    },
 }
 
 fn main() -> Result<ExitCode> {
@@ -30,21 +58,77 @@ fn main() -> Result<ExitCode> {
         Cmd::Init => init(),
         Cmd::Info => info(),
         Cmd::Embed { texts } => embed(&texts),
+        Cmd::Spaces { file } => {
+            let conn = open()?;
+            let (s, p) = spaces::load(&conn, &file)?;
+            println!("{s} spaces, {p} path rules");
+            Ok(ExitCode::SUCCESS)
+        }
+        Cmd::Where { dir } => {
+            let dir = match dir {
+                Some(d) => d,
+                None => std::env::current_dir()?,
+            };
+            let conn = open()?;
+            let space = spaces::resolve(&conn, &dir)?;
+            println!(
+                "{space}  (sees: {})",
+                spaces::visible(&conn, &space)?.join(", ")
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        Cmd::Import(cmd) => {
+            let conn = open()?;
+            spaces::ensure_builtin(&conn)?;
+            let report = match cmd {
+                ImportCmd::Memora { manifest, db } => {
+                    import::memora(&conn, &PathBuf::from(spaces::expand_home(&db)), &manifest)?
+                }
+                ImportCmd::AutoMemory { inventory, dir } => import::auto_memory(
+                    &conn,
+                    &PathBuf::from(spaces::expand_home(&dir)),
+                    &inventory,
+                )?,
+            };
+            println!("{report:?}");
+            Ok(ExitCode::SUCCESS)
+        }
+        Cmd::Reindex => {
+            let conn = open()?;
+            let started = std::time::Instant::now();
+            let (items, chunks) = index::embed_missing(&conn, |done, total| {
+                if done % 256 < 16 || done == total {
+                    eprintln!("  {done}/{total}");
+                }
+            })?;
+            println!(
+                "embedded {items} items, {chunks} chunks in {:?}",
+                started.elapsed()
+            );
+            Ok(ExitCode::SUCCESS)
+        }
     }
+}
+
+/// Opens the database, creating it on first use.
+fn open() -> Result<rusqlite::Connection> {
+    let path = db::db_path();
+    db::init(&path)?;
+    db::connect(&path)
 }
 
 fn embed(texts: &[String]) -> Result<ExitCode> {
     let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
     let started = std::time::Instant::now();
-    let vecs = engram::embed::embed(&refs)?;
+    let vecs = embed::embed(&refs)?;
     println!(
         "{} vectors x {} in {:?}",
         vecs.len(),
-        engram::embed::DIM,
+        embed::DIM,
         started.elapsed()
     );
     for i in 1..vecs.len() {
-        let cos = engram::embed::cosine(&vecs[0], &vecs[i]);
+        let cos = embed::cosine(&vecs[0], &vecs[i]);
         println!("cos(0,{i}) = {cos:.4}");
     }
     Ok(ExitCode::SUCCESS)
@@ -76,5 +160,34 @@ fn info() -> Result<ExitCode> {
     println!("vec      {vec}");
     println!("schema   {schema} ({journal})");
     println!("tables   {}", db::tables(&conn)?.join(" "));
+    println!(
+        "embed    {}",
+        if embed::is_running() {
+            "running"
+        } else {
+            "stopped"
+        }
+    );
+
+    let mut stmt = conn.prepare(
+        "SELECT space_id, status, count(*) FROM item GROUP BY space_id, status ORDER BY space_id, status",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (space, status, n) = row?;
+        println!("  {space:<24} {status:<11} {n}");
+    }
+    let (docs, chunks, vecs): (i64, i64, i64) = conn.query_row(
+        "SELECT (SELECT count(*) FROM doc), (SELECT count(*) FROM chunk), (SELECT count(*) FROM item_vec)",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    println!("docs {docs}, chunks {chunks}, item vectors {vecs}");
     Ok(ExitCode::SUCCESS)
 }

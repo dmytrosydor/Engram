@@ -9,7 +9,7 @@ INSERT OR IGNORE INTO meta (key, value) VALUES
   ('embed_model', 'BAAI/bge-m3'),
   ('embed_dim', '1024');
 
--- Spaces: 'global', 'work/ol', 'personal/laluk', ...
+-- Spaces: 'global', 'work/acme', 'personal/notes', ...
 CREATE TABLE IF NOT EXISTS space (
   id TEXT PRIMARY KEY,
   domain TEXT NOT NULL CHECK (domain IN ('global', 'work', 'personal')),
@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS item (
   legacy_id TEXT                       -- 'memora:<id>' / 'auto:<file>'
 );
 CREATE INDEX IF NOT EXISTS item_space_status ON item (space_id, status, kind);
+CREATE UNIQUE INDEX IF NOT EXISTS item_legacy ON item (legacy_id);
 
 -- Closed tag vocabulary.
 CREATE TABLE IF NOT EXISTS tag_vocab (tag TEXT PRIMARY KEY, note TEXT);
@@ -105,6 +106,7 @@ CREATE TABLE IF NOT EXISTS chunk (
   ord INTEGER,
   text TEXT
 );
+CREATE UNIQUE INDEX IF NOT EXISTS doc_uri ON doc (uri);
 CREATE INDEX IF NOT EXISTS chunk_doc ON chunk (doc_id, ord);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts USING fts5 (
