@@ -3,7 +3,7 @@ use std::process::ExitCode;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use engram::{db, embed, import, index, spaces};
+use engram::{db, embed, import, index, memory, spaces};
 
 #[derive(Parser)]
 #[command(
@@ -33,6 +33,24 @@ enum Cmd {
     Import(ImportCmd),
     /// Embed items and chunks that have no vector yet
     Reindex,
+    /// Run the MCP server on stdio (Claude Code starts this)
+    Mcp,
+    /// Search as Claude would from a folder
+    Search {
+        query: String,
+        /// Folder whose space to search from (default: current)
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// project, all or archive
+        #[arg(long)]
+        scope: Option<String>,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long, default_value_t = 8)]
+        limit: usize,
+    },
+    /// Print items in full
+    Get { ids: Vec<i64> },
 }
 
 #[derive(Subcommand)]
@@ -91,6 +109,52 @@ fn main() -> Result<ExitCode> {
                 )?,
             };
             println!("{report:?}");
+            Ok(ExitCode::SUCCESS)
+        }
+        Cmd::Mcp => {
+            engram::mcp::serve()?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Cmd::Search {
+            query,
+            dir,
+            scope,
+            kind,
+            limit,
+        } => {
+            let conn = open()?;
+            let dir = match dir {
+                Some(d) => d,
+                None => std::env::current_dir()?,
+            };
+            let space = spaces::resolve(&conn, &dir)?;
+            let visible = spaces::visible(&conn, &space)?;
+            let started = std::time::Instant::now();
+            let vector = embed::embed_one(&query).ok();
+            let embedded = started.elapsed();
+            let hits = memory::search(
+                &conn,
+                &memory::Query {
+                    text: &query,
+                    vector: vector.as_deref(),
+                    spaces: &visible,
+                    scope: memory::Scope::parse(scope.as_deref())?,
+                    kind: kind.as_deref(),
+                    limit,
+                },
+            )?;
+            for h in &hits {
+                println!("{}", h.line());
+            }
+            eprintln!(
+                "[{space}] embed {embedded:?}, total {:?}",
+                started.elapsed()
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        Cmd::Get { ids } => {
+            let conn = open()?;
+            println!("{}", memory::get(&conn, &ids, "cli")?);
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Reindex => {

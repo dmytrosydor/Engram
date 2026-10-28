@@ -4,5 +4,7 @@ pub mod db;
 pub mod embed;
 pub mod import;
 pub mod index;
+pub mod mcp;
+pub mod memory;
 pub mod spaces;
 pub mod store;
