@@ -1,0 +1,13 @@
+# Rust
+/target/
+
+# Data: the database lives outside the repo, never commit one
+*.db
+*.db-wal
+*.db-shm
+
+# Secrets
+.env
+.env.*
+
+.DS_Store
