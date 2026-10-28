@@ -1,6 +1,6 @@
 //! Writing items: hashing, titles, the change log.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -53,10 +53,12 @@ pub fn today(conn: &Connection) -> Result<String> {
     Ok(conn.query_row("SELECT date('now')", [], |r| r.get(0))?)
 }
 
-/// Whitespace-insensitive hash of the body, so reformatted copies still collide.
-pub fn content_hash(body: &str) -> String {
+/// Whitespace-insensitive hash of the body within a space, so reformatted copies
+/// still collide there while identical text in another space (another domain) is
+/// stored on its own and never reveals that the other copy exists.
+pub fn content_hash(space: &str, body: &str) -> String {
     let normalised = body.split_whitespace().collect::<Vec<_>>().join(" ");
-    let digest = Sha256::digest(normalised.as_bytes());
+    let digest = Sha256::digest(format!("{space}\n{normalised}").as_bytes());
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -83,7 +85,7 @@ pub fn clip(s: &str, max: usize) -> String {
 }
 
 pub fn insert_item(conn: &Connection, item: &NewItem, actor: &str) -> Result<Inserted> {
-    let hash = content_hash(&item.body);
+    let hash = content_hash(&item.space_id, &item.body);
     let existing: Option<i64> = conn
         .query_row(
             "SELECT id FROM item WHERE content_hash = ?1",
@@ -165,6 +167,31 @@ pub fn log(
 }
 
 /// Changes status (and optionally the replacement) with a log entry.
+/// Moves an item to another space and returns the space it came from.
+pub fn move_item(conn: &Connection, id: i64, to: &str, actor: &str) -> Result<String> {
+    crate::spaces::domain(conn, to)?;
+    let before = item_json(conn, id)?;
+    let from = before["space_id"].as_str().unwrap_or_default().to_string();
+    if from == to {
+        return Ok(from);
+    }
+    let body = before["body"].as_str().unwrap_or_default();
+    conn.execute(
+        "UPDATE item SET space_id = ?2, content_hash = ?3, updated_at = ?4 WHERE id = ?1",
+        params![id, to, content_hash(to, body), now(conn)?],
+    )
+    .with_context(|| format!("#{id}: the same text is already stored in {to}"))?;
+    log(
+        conn,
+        actor,
+        "move",
+        Some(id),
+        Some(&before),
+        Some(&item_json(conn, id)?),
+    )?;
+    Ok(from)
+}
+
 pub fn set_status(
     conn: &Connection,
     id: i64,
@@ -208,7 +235,7 @@ pub fn edit(
     conn.execute(
         "UPDATE item SET title = ?2, body = ?3, kind = ?4, space_id = ?5, content_hash = ?6, updated_at = ?7
          WHERE id = ?1",
-        params![id, title, body, kind, space, content_hash(body), now(conn)?],
+        params![id, title, body, kind, space, content_hash(space, body), now(conn)?],
     )?;
     if text_changed {
         conn.execute("DELETE FROM item_vec WHERE item_id = ?1", [id])?;

@@ -87,7 +87,7 @@ fn memora_import_is_complete_and_idempotent() {
     fs::write(dir.path().join("m.csv"), MANIFEST).unwrap();
     let before = fs::read(&src).unwrap();
 
-    let r = import::memora(&conn, &src, &dir.path().join("m.csv")).unwrap();
+    let r = import::memora(&conn, &src, Some(&dir.path().join("m.csv")), None).unwrap();
     assert_eq!(
         (r.items, r.docs, r.chunks, r.edges, r.unmapped),
         (5, 1, 2, 1, 1)
@@ -141,7 +141,7 @@ fn memora_import_is_complete_and_idempotent() {
         .collect();
     assert_eq!(texts, ["Part one", "Part two"]);
 
-    let again = import::memora(&conn, &src, &dir.path().join("m.csv")).unwrap();
+    let again = import::memora(&conn, &src, Some(&dir.path().join("m.csv")), None).unwrap();
     assert_eq!((again.items, again.docs), (0, 0));
     let tombstones: i64 = conn
         .query_row("SELECT count(*) FROM log WHERE op = 'tombstone'", [], |r| {
@@ -220,4 +220,50 @@ fn spaces_resolve_and_visibility() {
         ["work/acme", "work/_shared", "global"]
     );
     assert_eq!(spaces::visible(&conn, "global").unwrap(), ["global"]);
+    // a folder without a rule sees no domain at all
+    assert_eq!(
+        spaces::visible(&conn, spaces::INBOX).unwrap(),
+        [spaces::INBOX, "global"]
+    );
+}
+
+#[test]
+fn auto_memory_scan_places_projects_by_folder_rules() {
+    let (dir, conn) = setup();
+    let projects = dir.path().join("projects");
+    for (project, file, text) in [
+        (
+            "-code-acme",
+            "deploy.md",
+            "---\ntype: feedback\n---\nDeploy only on weekdays.\n",
+        ),
+        ("-code-acme-api", "limits.md", "API rate limit is 50 rps.\n"),
+        ("-tmp-scratch", "note.md", "Scratch folder note.\n"),
+        ("-code-acme", "MEMORY.md", "- index\n"),
+    ] {
+        let mem = projects.join(project).join("memory");
+        fs::create_dir_all(&mem).unwrap();
+        fs::write(mem.join(file), text).unwrap();
+    }
+    let r = import::auto_memory_scan(&conn, &projects).unwrap();
+    assert_eq!((r.items, r.dropped, r.unmapped), (3, 1, 1));
+    let placed = |legacy: &str| -> (String, String, String) {
+        conn.query_row(
+            "SELECT space_id, kind, status FROM item WHERE legacy_id = ?1",
+            [legacy],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        placed("auto:-code-acme/deploy.md"),
+        ("work/acme".into(), "rule".into(), "active".into())
+    );
+    assert_eq!(placed("auto:-code-acme-api/limits.md").0, "work/acme-api");
+    assert_eq!(
+        placed("auto:-tmp-scratch/note.md"),
+        (spaces::INBOX.into(), "fact".into(), "proposed".into())
+    );
+    let again = import::auto_memory_scan(&conn, &projects).unwrap();
+    assert_eq!((again.items, again.already), (0, 3));
 }

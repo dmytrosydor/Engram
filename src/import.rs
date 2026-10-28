@@ -1,9 +1,10 @@
-//! One-off import from Memora and Claude Code auto-memory.
+//! Import from Claude Code auto-memory and from Memora.
 //!
-//! Both sources are only read. Classification comes from manifest CSVs prepared
-//! during planning (one row per source record); rows missing from a manifest land in
-//! the inbox as `proposed`. Re-running is safe: anything with a known `legacy_id`
-//! or document URI is skipped.
+//! Both sources are only read. Auto-memory needs no setup: each project folder is
+//! mapped to a space by the folder rules. An optional manifest CSV (one row per
+//! source record) can classify records by hand; records it does not cover land as
+//! `proposed`. Re-running is safe: anything with a known `legacy_id` or document URI
+//! is skipped.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -49,11 +50,22 @@ struct Memory {
     updated_at: Option<String>,
 }
 
-pub fn memora(conn: &Connection, source: &Path, manifest: &Path) -> Result<Report> {
-    let plan: HashMap<i64, MemoraRow> = read_csv::<MemoraRow>(manifest)?
-        .into_iter()
-        .map(|r| (r.id, r))
-        .collect();
+/// Without a manifest every record lands in `fallback` (default: the inbox) as `proposed`.
+pub fn memora(
+    conn: &Connection,
+    source: &Path,
+    manifest: Option<&Path>,
+    fallback: Option<&str>,
+) -> Result<Report> {
+    let plan: HashMap<i64, MemoraRow> = match manifest {
+        Some(m) => read_csv::<MemoraRow>(m)?
+            .into_iter()
+            .map(|r| (r.id, r))
+            .collect(),
+        None => HashMap::new(),
+    };
+    let fallback = fallback.unwrap_or(INBOX);
+    spaces::domain(conn, fallback)?;
     let src = Connection::open_with_flags(
         format!("file:{}?mode=ro", source.display()),
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
@@ -71,7 +83,7 @@ pub fn memora(conn: &Connection, source: &Path, manifest: &Path) -> Result<Repor
         let Some(row) = plan.get(&m.id) else {
             report.unmapped += 1;
             let item = NewItem {
-                space_id: INBOX.into(),
+                space_id: fallback.into(),
                 kind: "fact".into(),
                 status: "proposed".into(),
                 ..memora_item(m)
@@ -342,6 +354,97 @@ struct AutoRow {
     action: String,
 }
 
+/// Every `<project>/memory/*.md` under `projects`, placed by the folder rules: a
+/// project folder is named after its path with `/` and `.` turned into `-`.
+/// Records of mapped projects are active; the rest wait in the inbox as proposed.
+pub fn auto_memory_scan(conn: &Connection, projects: &Path) -> Result<Report> {
+    let rules: Vec<(String, String)> = conn
+        .prepare("SELECT prefix, space_id FROM path_rule")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let encode = |p: &str| p.replace(['/', '.'], "-");
+    let mut report = Report::default();
+    let tx = conn.unchecked_transaction()?;
+    let mut dirs: Vec<_> = std::fs::read_dir(projects)
+        .with_context(|| format!("read {}", projects.display()))?
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    dirs.sort();
+    for dir in dirs {
+        let name = dir
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let space = rules
+            .iter()
+            .filter(|(prefix, _)| {
+                let p = encode(prefix.trim_end_matches('/'));
+                name == p || name.starts_with(&format!("{p}-"))
+            })
+            .max_by_key(|(prefix, _)| prefix.len())
+            .map(|(_, s)| s.clone());
+        let Ok(files) = std::fs::read_dir(dir.join("memory")) else {
+            continue;
+        };
+        let mut files: Vec<_> = files.flatten().map(|e| e.path()).collect();
+        files.sort();
+        for path in files {
+            let file = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            if !file.ends_with(".md") || file == "MEMORY.md" {
+                report.dropped += usize::from(file == "MEMORY.md");
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                report.dropped += 1;
+                continue;
+            };
+            let (front, body) = split_frontmatter(&text);
+            if body.trim().is_empty() {
+                report.dropped += 1;
+                continue;
+            }
+            let kind = match front.get("type").map(String::as_str) {
+                Some("user") => "preference",
+                Some("feedback") => "rule",
+                _ => "fact",
+            };
+            let (space_id, status) = match &space {
+                Some(s) => (s.clone(), "active"),
+                None => {
+                    report.unmapped += 1;
+                    (INBOX.to_string(), "proposed")
+                }
+            };
+            let title = front
+                .get("description")
+                .or_else(|| front.get("name"))
+                .map(|s| store::clip(s, store::TITLE_MAX))
+                .unwrap_or_else(|| store::title_from(body));
+            let item = NewItem {
+                space_id,
+                kind: kind.into(),
+                title,
+                body: body.trim().to_string(),
+                status: status.into(),
+                source: Some(format!("auto:{file}")),
+                created_at: modified(&path),
+                legacy_id: Some(format!("auto:{name}/{file}")),
+                ..NewItem::default()
+            };
+            record(&tx, &item, &mut report, |_| {})?;
+        }
+    }
+    tx.commit()?;
+    Ok(report)
+}
+
+/// Auto-memory classified by an inventory CSV (one row per file).
 pub fn auto_memory(conn: &Connection, projects: &Path, inventory: &Path) -> Result<Report> {
     let rows = read_csv::<AutoRow>(inventory)?;
     let mapper = Mapper::new(conn)?;

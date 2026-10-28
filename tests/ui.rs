@@ -44,7 +44,16 @@ fn ui_serves_local_pages_and_refuses_cross_site_requests() {
     }
     let host = format!("127.0.0.1:{port}");
 
-    for path in ["/", "/queue", "/feed", "/map", "/recall", "/health"] {
+    for path in [
+        "/",
+        "/queue",
+        "/feed",
+        "/map",
+        "/recall",
+        "/health",
+        "/assets/htmx.min.js",
+        "/assets/cytoscape.min.js",
+    ] {
         let resp = request(
             port,
             &format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"),
@@ -55,6 +64,7 @@ fn ui_serves_local_pages_and_refuses_cross_site_requests() {
             &resp[..resp.len().min(200)]
         );
         assert!(!resp.contains("class=err"), "{path} rendered an error");
+        assert!(!resp.contains("unpkg.com"), "{path} loads third-party code");
     }
 
     let rebinding = request(

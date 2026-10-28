@@ -9,8 +9,8 @@ use anyhow::{Context, Result, bail};
 use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
-use crate::embed;
 use crate::store::{self, BODY_MAX, Inserted, KINDS, NewItem, TITLE_MAX};
+use crate::{embed, spaces};
 
 const CANDIDATES: usize = 30;
 /// Nearest neighbours fetched before the space filter; the larger pool is
@@ -24,7 +24,7 @@ pub const SIMILAR: f32 = 0.88;
 pub enum Scope {
     /// Visible spaces, active and proposed items.
     Project,
-    /// Every space, active and proposed items.
+    /// Every space of the session's domain plus `global`, active and proposed items.
     All,
     /// Visible spaces, archived and superseded items.
     Archive,
@@ -97,7 +97,7 @@ pub fn kind_letter(kind: &str) -> &'static str {
 pub struct Query<'a> {
     pub text: &'a str,
     pub vector: Option<&'a [f32]>,
-    /// Spaces to search; ignored for `Scope::All`.
+    /// Spaces to search, always enforced; see [`spaces_for`].
     pub spaces: &'a [String],
     pub scope: Scope,
     pub kind: Option<&'a str>,
@@ -105,6 +105,15 @@ pub struct Query<'a> {
     /// Search as of this moment (evaluation replays old queries): later items are
     /// hidden and ages count from here. None = now.
     pub as_of: Option<&'a str>,
+}
+
+/// Spaces a session in `space` may search with `scope`. `All` widens to the whole
+/// domain, never across domains.
+pub fn spaces_for(conn: &Connection, space: &str, scope: Scope) -> Result<Vec<String>> {
+    match scope {
+        Scope::Project | Scope::Archive => spaces::visible(conn, space),
+        Scope::All => spaces::reachable(conn, space),
+    }
 }
 
 /// Hybrid search: two FTS lists and one vector list fused with RRF, then boosted.
@@ -227,16 +236,14 @@ fn filter(q: &Query) -> (String, Vec<Value>) {
         vec!["?"; statuses.len()].join(", ")
     ));
     args.extend(statuses.iter().map(|s| Value::Text(s.to_string())));
-    if q.scope != Scope::All {
-        sql.push(format!(
-            "i.space_id IN ({})",
-            vec!["?"; q.spaces.len().max(1)].join(", ")
-        ));
-        if q.spaces.is_empty() {
-            args.push(Value::Null);
-        }
-        args.extend(q.spaces.iter().map(|s| Value::Text(s.clone())));
+    sql.push(format!(
+        "i.space_id IN ({})",
+        vec!["?"; q.spaces.len().max(1)].join(", ")
+    ));
+    if q.spaces.is_empty() {
+        args.push(Value::Null);
     }
+    args.extend(q.spaces.iter().map(|s| Value::Text(s.clone())));
     if let Some(kind) = q.kind {
         sql.push("i.kind = ?".into());
         args.push(Value::Text(kind.into()));
@@ -282,7 +289,7 @@ fn ids(conn: &Connection, sql: &str, args: Vec<Value>) -> Result<Vec<i64>> {
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-/// Words of a query, keeping identifiers like `OL-611`, `$VAR`, `foo_bar.rs` whole.
+/// Words of a query, keeping identifiers like `ABC-123`, `$VAR`, `foo_bar.rs` whole.
 fn tokens(text: &str) -> Vec<String> {
     let mut out: Vec<String> = text
         .split(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '$' | '/')))
@@ -325,7 +332,7 @@ pub fn get(
             out.push(format!("#{id} not found"));
             continue;
         };
-        let links = links(conn, id)?;
+        let links = links(conn, id, visible)?;
         if !links.is_empty() {
             text.push_str(&format!("\nlinks: {}", links.join(", ")));
         }
@@ -345,21 +352,36 @@ pub fn get(
     Ok(out.join("\n\n"))
 }
 
-/// Confirmed links of an item, as `type #id` / `#id type this`.
-pub fn links(conn: &Connection, id: i64) -> Result<Vec<String>> {
+/// Confirmed links of an item, as `type #id` / `#id type this`. With `visible`,
+/// links to items outside those spaces are left out.
+pub fn links(conn: &Connection, id: i64, visible: Option<&[String]>) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(
-        "SELECT type, dst, 1 FROM edge WHERE src = ?1 AND confirmed = 1
-         UNION ALL SELECT type, src, 0 FROM edge WHERE dst = ?1 AND confirmed = 1",
+        "SELECT e.type, e.dst, 1, i.space_id FROM edge e JOIN item i ON i.id = e.dst
+         WHERE e.src = ?1 AND e.confirmed = 1
+         UNION ALL
+         SELECT e.type, e.src, 0, i.space_id FROM edge e JOIN item i ON i.id = e.src
+         WHERE e.dst = ?1 AND e.confirmed = 1",
     )?;
     let rows = stmt.query_map([id], |r| {
-        let (t, other, out): (String, i64, i64) = (r.get(0)?, r.get(1)?, r.get(2)?);
-        Ok(if out == 1 {
-            format!("{t} #{other}")
-        } else {
-            format!("#{other} {t} this")
-        })
+        let (t, other, out, space): (String, i64, i64, String) =
+            (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?);
+        Ok((
+            space,
+            if out == 1 {
+                format!("{t} #{other}")
+            } else {
+                format!("#{other} {t} this")
+            },
+        ))
     })?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
+    let mut out = Vec::new();
+    for row in rows {
+        let (space, link) = row?;
+        if visible.is_none_or(|v| v.contains(&space)) {
+            out.push(link);
+        }
+    }
+    Ok(out)
 }
 
 // ---------- write ----------
@@ -458,6 +480,10 @@ pub fn write(conn: &Connection, w: &Write, actor: &str) -> Result<Written> {
             )
             .optional()?;
         match target {
+            // every session sees global items, so one session must not rewrite or retire them
+            Some((space, _)) if space == "global" && w.space != "global" => {
+                bail!("#{id} is in global; change it in the review queue or the web UI")
+            }
             Some((space, status))
                 if w.visible.contains(&space) && (status == "active" || status == "proposed") => {}
             Some((_, status)) if w.visible.is_empty() => bail!("#{id} is {status}"),
@@ -485,7 +511,7 @@ pub fn write(conn: &Connection, w: &Write, actor: &str) -> Result<Written> {
                 title,
                 body,
                 w.valid_until,
-                store::content_hash(body),
+                store::content_hash(before["space_id"].as_str().unwrap_or_default(), body),
                 store::now(&tx)?
             ],
         )?;
@@ -592,8 +618,8 @@ mod tests {
     #[test]
     fn tokens_keep_identifiers() {
         assert_eq!(
-            tokens("Чому OL-611 і $VAR, foo_bar.rs?"),
-            ["чому", "ol-611", "і", "$var", "foo_bar.rs"]
+            tokens("Чому ABC-123 і $VAR, foo_bar.rs?"),
+            ["чому", "abc-123", "і", "$var", "foo_bar.rs"]
         );
     }
 }

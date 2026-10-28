@@ -25,6 +25,9 @@ use crate::store::{self, KINDS};
 use crate::{core, daily, db, embed, index, spaces};
 
 const ACTOR: &str = "ui";
+// Bundled so the UI works offline and loads no third-party code at runtime.
+const HTMX: &str = include_str!("assets/htmx.min.js"); // htmx 2.0.4, 0BSD
+const CYTOSCAPE: &str = include_str!("assets/cytoscape.min.js"); // cytoscape 3.30.2, MIT
 
 pub fn serve(port: u16) -> Result<()> {
     db::init(&db::db_path())?;
@@ -44,6 +47,11 @@ pub fn serve(port: u16) -> Result<()> {
         .route("/graph", get(graph))
         .route("/recall", get(recall))
         .route("/health", get(health))
+        .route("/assets/htmx.min.js", get(|| async { script(HTMX) }))
+        .route(
+            "/assets/cytoscape.min.js",
+            get(|| async { script(CYTOSCAPE) }),
+        )
         .layer(middleware::from_fn(move |req, next| guard(req, next, port)));
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -54,6 +62,17 @@ pub fn serve(port: u16) -> Result<()> {
         axum::serve(listener, app).await?;
         Ok(())
     })
+}
+
+fn script(body: &'static str) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "max-age=86400"),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 async fn guard(req: Request, next: Next, port: u16) -> Response {
@@ -114,7 +133,7 @@ fn layout(title: &str, body: &str) -> String {
         "<!doctype html><html lang=en><head><meta charset=utf-8>\
          <meta name=viewport content='width=device-width,initial-scale=1'>\
          <title>{t} · engram</title><style>{CSS}</style>\
-         <script src='https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js'></script></head>\
+         <script src='/assets/htmx.min.js'></script></head>\
          <body><nav><b>engram</b>{nav}</nav><main><h1>{t}</h1>{body}</main></body></html>",
         t = esc(title)
     )
@@ -210,7 +229,8 @@ async fn search_fragment(Query(p): Query<SearchQ>) -> Html<String> {
     blocking(move |conn| {
         let dir = PathBuf::from(spaces::expand_home(p.dir.as_deref().unwrap_or("~")));
         let space = spaces::resolve(conn, &dir)?;
-        let visible = spaces::visible(conn, &space)?;
+        let scope = Scope::parse(p.scope.as_deref())?;
+        let visible = memory::spaces_for(conn, &space, scope)?;
         let started = std::time::Instant::now();
         let vector = embed::embed_one(&p.q).ok();
         let hits = memory::search(
@@ -219,7 +239,7 @@ async fn search_fragment(Query(p): Query<SearchQ>) -> Html<String> {
                 text: &p.q,
                 vector: vector.as_deref(),
                 spaces: &visible,
-                scope: Scope::parse(p.scope.as_deref())?,
+                scope,
                 kind: None,
                 limit: 8,
                 as_of: None,
@@ -524,7 +544,7 @@ async fn item_page(Path(id): Path<i64>) -> Html<String> {
             b = esc(&body)
         )?;
         // memory::get would count this view as a hit; the UI must not skew that signal
-        let links = memory::links(conn, id)?;
+        let links = memory::links(conn, id, None)?;
         if !links.is_empty() {
             write!(out, "<h2>Links</h2><p>{}</p>", esc(&links.join(", ")))?;
         }
@@ -609,7 +629,7 @@ async fn map() -> Html<String> {
         }
         out.push_str(
             "</div><h2>Confirmed links</h2><div id=graph></div>\
-             <script src='https://unpkg.com/cytoscape@3.30.2/dist/cytoscape.min.js'></script>\
+             <script src='/assets/cytoscape.min.js'></script>\
              <script>
              function show(space){fetch('/graph?space='+encodeURIComponent(space)).then(r=>r.json()).then(g=>{
                const dark=matchMedia('(prefers-color-scheme: dark)').matches;
@@ -750,7 +770,10 @@ async fn health() -> Html<String> {
         for (name, v) in rows {
             write!(out, "<tr><td>{name}</td><td><b>{v}</b></td></tr>")?;
         }
-        let last = daily::meta(conn, "daily_last_run")?.unwrap_or_else(|| "never".into());
+        let mut last = daily::meta(conn, "daily_last_run")?.unwrap_or_else(|| "never".into());
+        if let Some(errors) = daily::meta(conn, "daily_last_errors")?.filter(|e| !e.is_empty()) {
+            write!(last, " · errors: {}", errors.replace('\n', "; "))?;
+        }
         write!(
             out,
             "<tr><td>Last daily pass</td><td><b>{}</b></td></tr>\

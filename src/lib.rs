@@ -12,6 +12,7 @@ pub mod install;
 pub mod mcp;
 pub mod memory;
 pub mod review;
+pub mod setup;
 pub mod spaces;
 pub mod store;
 pub mod transcript;

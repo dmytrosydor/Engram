@@ -24,8 +24,18 @@ enum Cmd {
     Info,
     /// Embed texts and print timing and pairwise cosine (starts llama-server if needed)
     Embed { texts: Vec<String> },
-    /// Load spaces and folder rules from a TOML file
-    Spaces { file: PathBuf },
+    /// Load spaces and folder rules from a TOML file; without one, list them
+    Spaces {
+        file: Option<PathBuf>,
+        /// Draft ~/.engram/spaces.toml from the folders Claude Code has worked in
+        #[arg(long)]
+        init: bool,
+    },
+    /// Fetch the embedding model into ~/.engram/models (0.6 GB, checksum verified)
+    #[command(subcommand)]
+    Model(ModelCmd),
+    /// Check the database, model, llama-server, claude, hook, MCP and schedule
+    Doctor,
     /// Print the space a folder maps to (default: current folder)
     Where { dir: Option<PathBuf> },
     /// Import from an existing memory store (sources are only read)
@@ -80,14 +90,24 @@ enum Cmd {
         #[arg(long)]
         space: Option<String>,
     },
+    /// Move items to another space
+    Move {
+        /// Target space
+        #[arg(long)]
+        to: String,
+        ids: Vec<i64>,
+    },
     /// The review queue
     #[command(subcommand)]
     Review(ReviewCmd),
-    /// Register the SessionStart hook, the MCP server and the daily launchd agent
+    /// Register the SessionStart hook, the MCP server and the hourly daily-pass job
     Install {
         /// Apply; without it only the plan is printed
         #[arg(long)]
         yes: bool,
+        /// Skip the scheduled daily pass (it calls `claude -p`)
+        #[arg(long)]
+        no_daily: bool,
     },
     /// Undo `install` (data stays)
     Uninstall {
@@ -143,6 +163,12 @@ enum ReviewCmd {
 }
 
 #[derive(Subcommand)]
+enum ModelCmd {
+    /// Download (or resume) and verify the model
+    Pull,
+}
+
+#[derive(Subcommand)]
 enum HookCmd {
     /// Print the space core
     SessionStart,
@@ -152,15 +178,20 @@ enum HookCmd {
 enum ImportCmd {
     /// Memora SQLite database
     Memora {
+        /// CSV classifying each record (id,space,kind,action); without it all land in --space
         #[arg(long)]
-        manifest: PathBuf,
+        manifest: Option<PathBuf>,
+        /// Where records without a manifest row go, as unreviewed (default: unsorted)
+        #[arg(long)]
+        space: Option<String>,
         #[arg(long, default_value = "~/.local/share/memora/memories.db")]
         db: String,
     },
-    /// Claude Code auto-memory folders
+    /// Claude Code auto-memory folders, placed by your folder rules
     AutoMemory {
+        /// CSV classifying each file by hand instead of by folder rules
         #[arg(long)]
-        inventory: PathBuf,
+        inventory: Option<PathBuf>,
         #[arg(long, default_value = "~/.claude/projects")]
         dir: String,
     },
@@ -171,12 +202,59 @@ fn main() -> Result<ExitCode> {
         Cmd::Init => init(),
         Cmd::Info => info(),
         Cmd::Embed { texts } => embed(&texts),
-        Cmd::Spaces { file } => {
+        Cmd::Spaces { file, init } => {
+            if init {
+                let draft = engram::setup::draft_spaces(&PathBuf::from(spaces::expand_home(
+                    "~/.claude/projects",
+                )))?;
+                let target = file.unwrap_or_else(|| db::home().join("spaces.toml"));
+                if target.exists() {
+                    print!("{draft}");
+                    eprintln!("{} exists; not overwritten (draft above)", target.display());
+                } else {
+                    std::fs::create_dir_all(db::home())?;
+                    std::fs::write(&target, draft)?;
+                    println!(
+                        "wrote {0}; edit the domains, then: engram spaces {0}",
+                        target.display()
+                    );
+                }
+                return Ok(ExitCode::SUCCESS);
+            }
             let conn = open()?;
-            let (s, p) = spaces::load(&conn, &file)?;
-            println!("{s} spaces, {p} path rules");
+            match file {
+                Some(file) => {
+                    let (s, p) = spaces::load(&conn, &file)?;
+                    println!("{s} spaces, {p} path rules");
+                }
+                None => {
+                    for space in spaces::all(&conn)? {
+                        println!(
+                            "{space:<28} {}",
+                            spaces::visible(&conn, &space)?[1..].join(", ")
+                        );
+                    }
+                    let mut stmt =
+                        conn.prepare("SELECT prefix, space_id FROM path_rule ORDER BY prefix")?;
+                    for row in stmt
+                        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                    {
+                        let (prefix, space) = row?;
+                        println!("{prefix} -> {space}");
+                    }
+                }
+            }
             Ok(ExitCode::SUCCESS)
         }
+        Cmd::Model(ModelCmd::Pull) => {
+            engram::setup::model_pull()?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Cmd::Doctor => Ok(if engram::setup::doctor()? {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        }),
         Cmd::Where { dir } => {
             let dir = match dir {
                 Some(d) => d,
@@ -194,14 +272,23 @@ fn main() -> Result<ExitCode> {
             let conn = open()?;
             spaces::ensure_builtin(&conn)?;
             let report = match cmd {
-                ImportCmd::Memora { manifest, db } => {
-                    import::memora(&conn, &PathBuf::from(spaces::expand_home(&db)), &manifest)?
-                }
-                ImportCmd::AutoMemory { inventory, dir } => import::auto_memory(
+                ImportCmd::Memora {
+                    manifest,
+                    space,
+                    db,
+                } => import::memora(
                     &conn,
-                    &PathBuf::from(spaces::expand_home(&dir)),
-                    &inventory,
+                    &PathBuf::from(spaces::expand_home(&db)),
+                    manifest.as_deref(),
+                    space.as_deref(),
                 )?,
+                ImportCmd::AutoMemory { inventory, dir } => {
+                    let dir = PathBuf::from(spaces::expand_home(&dir));
+                    match inventory {
+                        Some(inv) => import::auto_memory(&conn, &dir, &inv)?,
+                        None => import::auto_memory_scan(&conn, &dir)?,
+                    }
+                }
             };
             println!("{report:?}");
             Ok(ExitCode::SUCCESS)
@@ -223,7 +310,8 @@ fn main() -> Result<ExitCode> {
                 None => std::env::current_dir()?,
             };
             let space = spaces::resolve(&conn, &dir)?;
-            let visible = spaces::visible(&conn, &space)?;
+            let scope = memory::Scope::parse(scope.as_deref())?;
+            let visible = memory::spaces_for(&conn, &space, scope)?;
             let started = std::time::Instant::now();
             let vector = embed::embed_one(&query).ok();
             let embedded = started.elapsed();
@@ -233,7 +321,7 @@ fn main() -> Result<ExitCode> {
                     text: &query,
                     vector: vector.as_deref(),
                     spaces: &visible,
-                    scope: memory::Scope::parse(scope.as_deref())?,
+                    scope,
                     kind: kind.as_deref(),
                     limit,
                     as_of: None,
@@ -322,6 +410,15 @@ fn main() -> Result<ExitCode> {
             println!("inbox #{id} ({space}); processed by the next daily pass");
             Ok(ExitCode::SUCCESS)
         }
+        Cmd::Move { to, ids } => {
+            let conn = open()?;
+            for id in ids {
+                let from = engram::store::move_item(&conn, id, &to, "cli")?;
+                println!("#{id} {from} -> {to}");
+            }
+            core::rebuild_all(&conn)?;
+            Ok(ExitCode::SUCCESS)
+        }
         Cmd::Eval(EvalCmd::Extract { out }) => {
             let out = PathBuf::from(spaces::expand_home(&out));
             if let Some(dir) = out.parent() {
@@ -366,8 +463,8 @@ fn main() -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        Cmd::Install { yes } => {
-            engram::install::install(yes)?;
+        Cmd::Install { yes, no_daily } => {
+            engram::install::install(yes, !no_daily)?;
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Uninstall { yes } => {

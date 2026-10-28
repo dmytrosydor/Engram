@@ -199,20 +199,7 @@ fn apply(conn: &Connection, e: &Entry, edited: Option<NewProposal>, actor: &str)
         "move" => {
             let id = *e.item_ids.first().context("move without item")?;
             let to = e.proposal["space"].as_str().context("move without space")?;
-            let before = store::item_json(conn, id)?;
-            let from = before["space_id"].as_str().unwrap_or_default().to_string();
-            conn.execute(
-                "UPDATE item SET space_id = ?2, updated_at = ?3 WHERE id = ?1",
-                params![id, to, store::now(conn)?],
-            )?;
-            store::log(
-                conn,
-                actor,
-                "move",
-                Some(id),
-                Some(&before),
-                Some(&store::item_json(conn, id)?),
-            )?;
+            let from = store::move_item(conn, id, to, actor)?;
             crate::core::rebuild_all(conn)?;
             format!("#{id} moved {from} -> {to}")
         }

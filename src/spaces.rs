@@ -20,14 +20,11 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
-pub const INBOX: &str = "personal/_inbox";
+/// Where sessions in folders without a rule land. It is its own domain, so such a
+/// session sees only this space and `global`, never another domain's records.
+pub const INBOX: &str = "unsorted";
 /// Spaces every database has, whatever the config says.
-const BUILTIN: [(&str, &str); 4] = [
-    ("global", "global"),
-    ("work/_shared", "work"),
-    ("personal/_shared", "personal"),
-    (INBOX, "personal"),
-];
+const BUILTIN: [(&str, &str); 2] = [("global", "global"), (INBOX, INBOX)];
 
 #[derive(Deserialize)]
 struct Config {
@@ -70,12 +67,24 @@ pub fn load(conn: &Connection, file: &Path) -> Result<(usize, usize)> {
     let tx = conn.unchecked_transaction()?;
     ensure_builtin(&tx)?;
     for (id, def) in &cfg.spaces {
+        if def.domain == "global" || def.domain == INBOX {
+            // the built-in spaces may be listed; nothing else may join their domains
+            if *id == def.domain {
+                continue;
+            }
+            bail!("space {id}: domain {} is reserved", def.domain);
+        }
         tx.execute(
             "INSERT INTO space (id, domain) VALUES (?1, ?2)
              ON CONFLICT (id) DO UPDATE SET domain = excluded.domain",
             params![id, def.domain],
         )
         .with_context(|| format!("space {id}"))?;
+        // every domain gets a space its projects share
+        tx.execute(
+            "INSERT OR IGNORE INTO space (id, domain) VALUES (?1, ?2)",
+            params![format!("{}/_shared", def.domain), def.domain],
+        )?;
     }
     tx.execute("DELETE FROM path_rule", [])?;
     for (prefix, space) in &cfg.paths {
@@ -87,7 +96,7 @@ pub fn load(conn: &Connection, file: &Path) -> Result<(usize, usize)> {
         }
         tx.execute(
             "INSERT INTO path_rule (prefix, space_id) VALUES (?1, ?2)",
-            params![expand_home(prefix), space],
+            params![canonical(&expand_home(prefix)), space],
         )?;
     }
     tx.execute(
@@ -123,7 +132,8 @@ pub fn all(conn: &Connection) -> Result<Vec<String>> {
 
 /// Space of a session folder: the longest matching prefix wins, unknown -> inbox.
 pub fn resolve(conn: &Connection, cwd: &Path) -> Result<String> {
-    let cwd = cwd.to_string_lossy();
+    // symlinks and other spellings of the same folder resolve like the folder itself
+    let cwd = canonical(&cwd.to_string_lossy());
     let mut stmt = conn.prepare("SELECT prefix, space_id FROM path_rule")?;
     let rules = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
     let mut best: Option<(String, String)> = None;
@@ -150,12 +160,32 @@ pub fn domain(conn: &Connection, space: &str) -> Result<String> {
 pub fn visible(conn: &Connection, space: &str) -> Result<Vec<String>> {
     let domain = domain(conn, space)?;
     let mut out = vec![space.to_string()];
-    if domain != "global" {
+    if domain != "global" && domain != INBOX {
         out.push(format!("{domain}/_shared"));
+    }
+    if domain != "global" {
         out.push("global".into());
     }
     out.dedup();
     Ok(out)
+}
+
+/// Every space of `space`'s domain plus `global`: the widest a session may search.
+pub fn reachable(conn: &Connection, space: &str) -> Result<Vec<String>> {
+    let domain = domain(conn, space)?;
+    let mut stmt =
+        conn.prepare("SELECT id FROM space WHERE domain IN (?1, 'global') ORDER BY id")?;
+    let ids = stmt
+        .query_map([&domain], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(ids)
+}
+
+/// The real path when it exists (symlinks resolved), otherwise the path as given.
+fn canonical(path: &str) -> String {
+    std::fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.trim_end_matches('/').to_string())
 }
 
 pub fn expand_home(p: &str) -> String {

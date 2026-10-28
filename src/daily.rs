@@ -142,12 +142,26 @@ pub fn not_due(conn: &Connection) -> Result<Option<String>> {
     Ok(None)
 }
 
+/// True unless the machine reports running on battery (desktops have no battery).
 fn on_ac_power() -> bool {
-    Command::new("pmset")
-        .args(["-g", "batt"])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains("AC Power"))
-        .unwrap_or(true)
+    if cfg!(target_os = "macos") {
+        return Command::new("pmset")
+            .args(["-g", "batt"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("AC Power"))
+            .unwrap_or(true);
+    }
+    // Linux: an AC adapter ("Mains") that reports offline means battery
+    let Ok(supplies) = std::fs::read_dir("/sys/class/power_supply") else {
+        return true;
+    };
+    let read = |p: std::path::PathBuf| std::fs::read_to_string(p).unwrap_or_default();
+    let mains: Vec<_> = supplies
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| read(p.join("type")).trim() == "Mains")
+        .collect();
+    mains.is_empty() || mains.iter().any(|p| read(p.join("online")).trim() == "1")
 }
 
 pub fn run(
@@ -197,7 +211,13 @@ pub fn run(
     ));
 
     let proposed = proposed_items(conn, opts.classify)?;
-    for batch in proposed.chunks(CLASSIFY_BATCH) {
+    // one prompt never carries two domains' records
+    let batches = proposed
+        .chunk_by(|a, b| a.0 == b.0)
+        .flat_map(|run| run.chunks(CLASSIFY_BATCH))
+        .map(|chunk| chunk.iter().map(|(_, id)| *id).collect::<Vec<_>>());
+    for batch in batches {
+        let batch = batch.as_slice();
         match classify(conn, llm, batch) {
             Ok((n, archived, global)) => {
                 r.classified += n;
@@ -281,6 +301,8 @@ pub fn run(
     r.cores = core::rebuild_all(conn)?.len();
     set_meta(conn, "daily_last_run", &store::today(conn)?)?;
     set_meta(conn, "daily_last_ns", &next_since.to_string())?;
+    // shown on the health page and by `engram doctor`, since scheduled runs are silent
+    set_meta(conn, "daily_last_errors", &r.errors.join("\n"))?;
     store::log(
         conn,
         ACTOR,
@@ -416,13 +438,16 @@ fn judge_pairs(conn: &Connection, llm: &dyn Llm, pairs: &[(i64, i64, f32)]) -> R
     Ok(queued)
 }
 
-/// Oldest unreviewed items.
-fn proposed_items(conn: &Connection, limit: usize) -> Result<Vec<i64>> {
+/// Oldest unreviewed items as (domain, id), grouped by domain.
+fn proposed_items(conn: &Connection, limit: usize) -> Result<Vec<(String, i64)>> {
     let mut stmt = conn.prepare(
-        "SELECT id FROM item WHERE status = 'proposed' ORDER BY created_at, id LIMIT ?1",
+        "SELECT domain, id FROM (
+             SELECT s.domain, i.id, i.created_at FROM item i JOIN space s ON s.id = i.space_id
+             WHERE i.status = 'proposed' ORDER BY i.created_at, i.id LIMIT ?1)
+         ORDER BY domain, created_at, id",
     )?;
     let ids = stmt
-        .query_map([limit as i64], |r| r.get(0))?
+        .query_map([limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
     Ok(ids)
 }

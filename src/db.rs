@@ -51,12 +51,59 @@ pub fn connect(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Current schema version, stored in `PRAGMA user_version`.
+pub const VERSION: i64 = 2;
+
 /// Creates the database or brings it up to the current schema.
 pub fn init(path: &Path) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     }
-    connect(path)?.execute_batch(SCHEMA).context("apply schema")
+    let conn = connect(path)?;
+    conn.execute_batch(SCHEMA).context("apply schema")?;
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version < 2 {
+        // v2: domains are free-form (v1 allowed only global/work/personal) and
+        // content hashes are per space
+        let old: String = conn.query_row(
+            "SELECT sql FROM sqlite_schema WHERE name = 'space'",
+            [],
+            |r| r.get(0),
+        )?;
+        if old.contains("domain IN") {
+            conn.pragma_update(None, "foreign_keys", false)?;
+            conn.execute_batch(
+                "BEGIN;
+                 CREATE TABLE space_v2 (
+                   id TEXT PRIMARY KEY,
+                   domain TEXT NOT NULL CHECK (domain <> ''),
+                   core TEXT,
+                   core_tokens INTEGER,
+                   core_built_at TEXT
+                 );
+                 INSERT INTO space_v2 SELECT id, domain, core, core_tokens, core_built_at FROM space;
+                 DROP TABLE space;
+                 ALTER TABLE space_v2 RENAME TO space;
+                 COMMIT;",
+            )?;
+            conn.pragma_update(None, "foreign_keys", true)?;
+        }
+        let tx = conn.unchecked_transaction()?;
+        let rows: Vec<(i64, String, String)> = tx
+            .prepare("SELECT id, space_id, body FROM item")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (id, space, body) in rows {
+            tx.execute(
+                "UPDATE item SET content_hash = ?2 WHERE id = ?1",
+                rusqlite::params![id, crate::store::content_hash(&space, &body)],
+            )?;
+        }
+        tx.commit()?;
+    }
+    crate::spaces::ensure_builtin(&conn)?;
+    conn.pragma_update(None, "user_version", VERSION)?;
+    Ok(())
 }
 
 /// Real and virtual tables, without FTS5 / vec0 internals.

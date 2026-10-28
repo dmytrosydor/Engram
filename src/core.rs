@@ -4,7 +4,7 @@
 //! `space.core`, and served by the SessionStart hook in milliseconds.
 
 use anyhow::Result;
-use rusqlite::{Connection, params_from_iter};
+use rusqlite::{Connection, OptionalExtension, params_from_iter};
 
 use crate::memory::Hit;
 use crate::spaces;
@@ -48,7 +48,8 @@ const SECTIONS: [Section; 4] = [
     },
     Section {
         title: "often opened",
-        sql: "SELECT * FROM v WHERE hits > 0 AND status IN ('active', 'proposed')
+        sql: "SELECT * FROM v WHERE hits > 0
+              AND (status = 'active' OR (status = 'proposed' AND space_id = :space))
               ORDER BY hits DESC, last_hit DESC",
         limit: 10,
     },
@@ -131,14 +132,17 @@ pub fn rebuild_all(conn: &Connection) -> Result<Vec<(String, usize)>> {
 }
 
 /// The stored core, built on first use.
+/// The stored core of a space, built on first use; empty for an unknown space.
 pub fn get(conn: &Connection, space: &str) -> Result<String> {
-    let stored: Option<String> =
-        conn.query_row("SELECT core FROM space WHERE id = ?1", [space], |r| {
+    let stored: Option<Option<String>> = conn
+        .query_row("SELECT core FROM space WHERE id = ?1", [space], |r| {
             r.get(0)
-        })?;
+        })
+        .optional()?;
     match stored {
-        Some(text) => Ok(text),
-        None => {
+        None => Ok(String::new()),
+        Some(Some(text)) => Ok(text),
+        Some(None) => {
             rebuild(conn, space)?;
             Ok(
                 conn.query_row("SELECT core FROM space WHERE id = ?1", [space], |r| {
@@ -149,7 +153,7 @@ pub fn get(conn: &Connection, space: &str) -> Result<String> {
     }
 }
 
-/// Rough count for mixed Ukrainian/English/code text.
+/// Rough token count for mixed natural-language and code text.
 pub fn estimate_tokens(text: &str) -> usize {
     text.chars().count().div_ceil(3)
 }

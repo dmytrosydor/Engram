@@ -2,7 +2,13 @@
 name = "engram"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.89"
 description = "Local long-term memory for Claude Code: SQLite + FTS5 + sqlite-vec."
+license = "MIT"
+repository = "https://github.com/dmytrosydor/Engram"
+readme = "README.md"
+keywords = ["claude-code", "memory", "mcp", "sqlite", "embeddings"]
+categories = ["command-line-utilities", "development-tools"]
 publish = false
 
 [dependencies]

@@ -140,7 +140,31 @@ fn search_respects_spaces_and_finds_by_words_or_vector() {
         found.contains(&personal) && !found.contains(&work),
         "work never leaks into personal"
     );
-    assert!(search(&conn, "deploy", None, &[], Scope::All).contains(&work));
+
+    // `all` widens to the whole domain but never crosses it
+    conn.execute(
+        "INSERT INTO space (id, domain) VALUES ('work/other', 'work')",
+        [],
+    )
+    .unwrap();
+    let sibling = put(
+        &conn,
+        "work/other",
+        "fact",
+        "Deploy on Fridays",
+        "Never",
+        None,
+    );
+    let wide = memory::spaces_for(&conn, "work/acme", Scope::All).unwrap();
+    let found = search(&conn, "deploy", None, &wide, Scope::All);
+    assert!(found.contains(&work) && found.contains(&sibling) && !found.contains(&personal));
+    let wide = memory::spaces_for(&conn, "personal/side", Scope::All).unwrap();
+    let found = search(&conn, "deploy", Some(axis(1)), &wide, Scope::All);
+    assert!(
+        found.contains(&personal) && !found.contains(&work) && !found.contains(&sibling),
+        "scope=all from personal must not see work"
+    );
+    assert!(search(&conn, "deploy", None, &[], Scope::All).is_empty());
 }
 
 #[test]
@@ -361,4 +385,41 @@ fn sessions_cannot_touch_or_read_other_domains() {
             .unwrap()
             .contains("10.0.0.5")
     );
+
+    // the same text in another domain is stored on its own, not reported as "exists"
+    let w = Write {
+        kind: "fact",
+        title: "Stand IP",
+        body: "The stand is at 10.0.0.5",
+        space: "personal/side",
+        source: None,
+        valid_until: None,
+        mode: Some("add"),
+        vector: None,
+        visible: &personal,
+        status: "active",
+    };
+    let mine = match memory::write(&conn, &w, "t").unwrap() {
+        Written::Created(id) => id,
+        other => panic!("cross-domain duplicate leaked: {other:?}"),
+    };
+
+    // links to items the session cannot see are hidden
+    conn.execute(
+        "INSERT INTO edge (src, dst, type, confirmed) VALUES (?1, ?2, 'about', 1)",
+        [mine, work],
+    )
+    .unwrap();
+    let got = memory::get(&conn, &[mine], "s", Some(&personal)).unwrap();
+    assert!(!got.contains(&format!("#{work}")), "{got}");
+
+    // global items are shared by every session, so no session rewrites or retires them
+    let shared = put(&conn, "global", "rule", "Be brief", "Short answers", None);
+    for mode in [format!("update:{shared}"), format!("supersede:{shared}")] {
+        let w = Write {
+            mode: Some(&mode),
+            ..w
+        };
+        assert!(memory::write(&conn, &w, "t").is_err(), "{mode} on global");
+    }
 }

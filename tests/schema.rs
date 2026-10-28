@@ -85,7 +85,7 @@ fn init_creates_all_tables_and_is_idempotent() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 1);
+    assert_eq!(version, db::VERSION);
     let dim: String = conn
         .query_row("SELECT value FROM meta WHERE key = 'embed_dim'", [], |r| {
             r.get(0)

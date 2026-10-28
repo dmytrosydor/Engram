@@ -1,69 +1,178 @@
 # Engram
 
-Local long-term memory for Claude Code. One Rust binary, one SQLite file (FTS5 + `sqlite-vec`) and a local bge-m3 embedding model served by llama.cpp on Metal.
+Local long-term memory for [Claude Code](https://code.claude.com). One Rust binary and one SQLite file. Search runs on your machine (full-text plus a local embedding model), and your work and personal projects never see each other's memory.
 
-- **A core at session start.** A `SessionStart` hook adds, in about 1 ms, a short core for the space of the current folder (≤ 6,000 characters): rules, current state, recent decisions and what gets opened most.
-- **Three MCP tools:** `search` (by words and by meaning, scoped to the space), `get`, and `write` (refuses near-duplicates until you pick a mode).
-- **Spaces.** `work/…` and `personal/…` are resolved from the folder; work never sees personal records and vice versa. `global` is visible everywhere.
-- **Daily pass.** Once a day (on AC power) expired state is archived, near-duplicates and new knowledge from transcripts go to a review queue, and unreviewed imports are classified. The model is an isolated `claude -p` with no tools.
-- **Web UI** on `127.0.0.1:7777`: what Claude gets, the queue, a feed, a map, the recall log and health.
+[![ci](https://github.com/dmytrosydor/Engram/actions/workflows/ci.yml/badge.svg)](https://github.com/dmytrosydor/Engram/actions/workflows/ci.yml)
+![platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)
+![license](https://img.shields.io/badge/license-MIT-blue)
 
-## Install
+- **A small core at every session start.** A `SessionStart` hook adds, in about a millisecond, a short summary of what matters in the current project (≤ 6,000 characters): rules and preferences, current state, recent decisions, what gets opened most. It does not dump all of memory into the context.
+- **Search, get, write over MCP.** Claude looks things up on demand. Hybrid search combines two FTS5 indexes and vector search (bge-m3, multilingual), takes ~30 ms, and needs no API key.
+- **Isolation enforced in code, not in a prompt.** Folders map to spaces, and spaces belong to domains such as `work` and `personal`. A session can only read and change its own domain plus a `global` space (details below).
+- **You approve what it learns.** Once a day a background pass proposes merges of near-duplicates and new knowledge from your recent sessions. Nothing lands in memory until you accept it in the review queue.
+- **A local web UI** at `127.0.0.1:7777`: what Claude gets for a folder, the review queue, a feed, a map of spaces and links, the recall log and health.
+
+## Quickstart
+
+You need macOS or Linux, [Rust](https://rustup.rs) 1.89+, [llama.cpp](https://github.com/ggml-org/llama.cpp) (for `llama-server`), the `claude` CLI and `curl`.
 
 ```sh
-brew install rust llama.cpp
-cargo install --path .
-mkdir -p ~/.engram/models
-curl -L -o ~/.engram/models/bge-m3-Q8_0.gguf \
-  https://huggingface.co/gpustack/bge-m3-GGUF/resolve/main/bge-m3-Q8_0.gguf
+brew install llama.cpp                 # Linux: a llama.cpp release or your package manager (CUDA or CPU build)
+cargo install --git https://github.com/dmytrosydor/Engram
+export PATH="$HOME/.cargo/bin:$PATH"   # add to your shell profile if cargo's bin is not on PATH yet
+
+engram model pull                      # 0.6 GB embedding model into ~/.engram/models, checksum verified
+engram spaces --init                   # drafts ~/.engram/spaces.toml from the folders Claude Code has worked in
+$EDITOR ~/.engram/spaces.toml          # name your domains (e.g. work / personal), drop what you don't need
+engram spaces ~/.engram/spaces.toml
+engram import auto-memory              # optional: bring in Claude Code's existing auto-memory
+engram doctor                          # checks every piece
+engram install                         # prints the plan; nothing changes yet
+engram install --yes                   # hook + MCP server + hourly daily-pass job
 ```
 
-Spaces and folder → space rules live in `~/.engram/spaces.toml`:
+Open a new Claude Code session in one of your projects. The first lines of context start with `engram memory · space …`.
+
+## How it works
+
+```
+new session ──► SessionStart hook ──► core of the folder's space (prebuilt, ≤ 6k chars)
+
+Claude ──MCP──► search / get / write ──► ~/.engram/engram.db
+                                          SQLite · FTS5 trigram + word · sqlite-vec
+                                          ▲
+                     llama-server (bge-m3) ┘  on demand over a Unix socket, sleeps when idle
+
+hourly job ──► engram daily --if-due ──► claude -p (no tools) ──► review queue ──► you, in the UI
+```
+
+- **Records** are short, typed and dated: `rule`, `preference`, `decision`, `fact`, `gotcha`, `lesson`, `state`, `task`, `person`, `event`. Titles are ≤ 120 characters and bodies ≤ 1,500.
+- **`write` refuses near-duplicates** (cosine ≥ 0.88) and lists them. Claude then picks `add`, `update:<id>` or `supersede:<id>`.
+- **State expires.** `state` and `task` records can carry `valid_until`, and the daily pass archives them once it passes. Old state also ranks lower in search.
+- **The core is rebuilt** whenever a write touches it, and by the daily pass.
+
+## Spaces, domains and what is guaranteed
+
+`~/.engram/spaces.toml` maps folders to spaces. The longest matching folder prefix wins, and symlinks are resolved first.
 
 ```toml
 [spaces]
-"work/acme" = { domain = "work" }
+"work/acme"      = { domain = "work" }
+"work/acme-api"  = { domain = "work" }
 "personal/notes" = { domain = "personal" }
 
 [paths]
-"~/code/acme" = "work/acme"
-"~/notes" = "personal/notes"
+"~/code/acme"     = "work/acme"
+"~/code/acme/api" = "work/acme-api"
+"~/notes"         = "personal/notes"
 ```
+
+Every domain automatically gets a `<domain>/_shared` space for knowledge its projects share. Two spaces are built in: `global`, visible to everyone, and `unsorted`, for folders without a rule.
+
+The code guarantees the following:
+
+- **What a session sees.** A session in space `S` of domain `D` sees `S`, `D/_shared` and `global`. With `scope: "all"` it sees every space of `D` plus `global`. A session in `unsorted` sees only `unsorted` and `global`.
+- **`get`** returns "not found" for records outside those spaces.
+- **`write`** refuses to target a space the session cannot see. `update` and `supersede` work only on records the session can see, and never on `global` records, which change only through the review queue or the UI.
+- **Writes to `global`** are stored as unreviewed and reach other sessions' cores only after you accept them.
+- **Duplicate detection** works within one space. Writing text that happens to exist in another domain neither fails nor reveals that the other copy exists.
+- **Links** returned by `get` leave out records the session cannot see.
+- **The daily pass** never puts two domains' records in the same model request. Everything it proposes stays in the record's own domain or waits for your approval.
+
+What is **not** isolated:
+
+- **The web UI** shows every domain. It listens only on `127.0.0.1` and rejects cross-site and DNS-rebinding requests, but it has no login.
+- **The database file** is readable by your user account.
+- **The daily pass sends text to Claude.** It runs `claude -p`, which sends the transcript excerpts and records it is judging to Anthropic, the same way your normal Claude Code sessions do. Use `engram install --yes --no-daily` to skip it.
+
+## Daily pass
+
+The scheduled job runs at most once a day, only on AC power. It:
+
+1. archives expired `state` and `task` records;
+2. finds near-duplicate pairs within a domain and asks the model whether to merge them;
+3. classifies unreviewed (imported) records as keep or archive;
+4. reads Claude Code transcripts changed since the last run and proposes durable knowledge from them;
+5. turns notes from `engram add "…"` and files dropped in `~/.engram/inbox/` into proposals;
+6. rebuilds every core.
+
+With the default limits a run makes up to about 15 `claude -p` calls on Sonnet. They count against your Claude Code plan, or are billed to your API key if you use one. Set `ENGRAM_DAILY_MODEL` to choose another model. Run it by hand with `engram daily`. The last run and its errors show on the UI health page and in `engram doctor`.
+
+## Resources
+
+- **Model:** 0.6 GB on disk (bge-m3, Q8 GGUF).
+- **Memory:** about 820 MB while warm. After 10 idle minutes it drops to a ~180 MB process and wakes in ~0.4 s.
+- **GPU:** Metal on Apple silicon and CUDA where llama.cpp has it; otherwise it runs on the CPU.
+- **Search latency:** ~30 ms (p50) on an M-series Mac with ~3,000 records.
+- **Hook:** about 1 ms.
+
+## Configuration
+
+| | |
+|---|---|
+| `~/.engram/spaces.toml` | spaces, domains, folder rules (`engram spaces <file>` loads it, `engram spaces` lists what is loaded) |
+| `ENGRAM_HOME` | data folder (default `~/.engram`) |
+| `ENGRAM_LLAMA_SERVER` | path to `llama-server` (default: `PATH`, then `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, `~/.local/bin`) |
+| `ENGRAM_EMBED_SOCK` | Unix socket for llama-server (default `~/.engram/embed.sock`) |
+| `ENGRAM_DAILY_MODEL` | model for the daily pass (default `sonnet`) |
+
+## Importing
+
+- `engram import auto-memory` reads `~/.claude/projects/*/memory/*.md` and places each project by your folder rules. Records from unmapped projects wait in `unsorted` as unreviewed. Re-running only adds what is new.
+- `engram import memora [--space S] [--manifest file.csv]` imports a Memora database read-only. Without a manifest every record lands in `--space` (default `unsorted`) as unreviewed, and the daily pass sorts it.
+
+After an import, `engram reindex` computes the vectors. That takes about 5 minutes for 3,000 records.
+
+## Commands
+
+| | |
+|---|---|
+| `engram doctor` | check database, model, llama-server, claude, hook, MCP and schedule |
+| `engram where [dir]` | which space a folder maps to and what it sees |
+| `engram core [dir]` / `--all` | the core a session there gets / sizes of all cores |
+| `engram search "q" [--dir d] [--scope project\|all\|archive]` | search as Claude would from a folder |
+| `engram get <id>…` | records in full |
+| `engram add "note"` | drop a note for the next daily pass |
+| `engram review list \| accept <id> \| reject <id>` | the review queue |
+| `engram move --to <space> <id>…` | move records to another space |
+| `engram daily` | run the daily pass now |
+| `engram ui [--port 7777]` | the web UI |
+| `engram eval extract && engram eval run` | search quality on your own past sessions (Memora history) |
+| `engram uninstall --yes` | remove hook, MCP server and schedule; data stays |
+
+## Uninstall
 
 ```sh
-engram spaces ~/.engram/spaces.toml
-engram install          # shows the plan
-engram install --yes    # SessionStart hook, MCP server, launchd agent for the daily pass
+engram uninstall --yes    # removes the hook, the MCP server and the scheduled job
+rm -rf ~/.engram          # removes the data and the model, if you want that too
 ```
 
-`engram uninstall --yes` removes all of that; the data in `~/.engram` stays.
+`engram install` backs up `~/.claude/settings.json` before editing it, as `settings.json.engram-<time>`.
 
-## Import (optional)
+## Troubleshooting
 
-From Memora and Claude Code auto-memory; the sources are only read. Classification comes from CSV manifests (one row per record); records without a row go to `personal/_inbox` as unreviewed.
+- **No core at session start.** Run `echo '{"cwd":"'$PWD'"}' | engram hook session-start`. If it prints nothing, the folder's space has no records yet, or the folder has no rule (`engram where`).
+- **The MCP server is not connected.** Run `claude mcp get engram`. A local- or project-scope server with the same name overrides the user-scope one.
+- **Search says "words only".** The model or `llama-server` is missing; see `engram doctor`.
+- **`command not found: engram`.** Put `~/.cargo/bin` on your `PATH`.
+- **Wrong space.** Run `engram where`. Rules are folder prefixes after symlinks are resolved; reload `spaces.toml` after editing it.
 
-```sh
-engram import memora --manifest memora-manifest.csv
-engram import auto-memory --inventory auto-memory-inventory.csv
-engram reindex
-```
+## FAQ
 
-## Day to day
+**Does it replace Claude Code's auto-memory?** It can. Import auto-memory once, then turn auto-memory off (`autoMemoryEnabled: false`) so the same knowledge does not load twice.
 
-```sh
-engram ui                      # http://127.0.0.1:7777
-engram search "query" --dir ~/code/acme
-engram add "a note for the next daily pass"
-engram review list | accept <id> | reject <id>
-engram daily                   # run now instead of waiting for launchd
-engram eval extract && engram eval run   # search quality on your own history
-```
+**Windows?** Not supported natively. Under WSL it behaves like Linux.
 
-The data folder is `~/.engram` (or `ENGRAM_HOME`); the model and its socket always live in `~/.engram`.
+**Other MCP clients?** `engram mcp` is a standard stdio MCP server. The space comes from the folder the client starts it in, or from `CLAUDE_PROJECT_DIR`.
 
 ## Development
 
 ```sh
-cargo test                     # no model needed
-cargo test -- --include-ignored   # with the model in ~/.engram/models
+cargo test                        # no model needed
+cargo test -- --include-ignored   # also the model-backed tests (model + llama-server required)
+cargo clippy --all-targets
 ```
+
+## License
+
+MIT, see [LICENSE](LICENSE). Bundled in the binary: [htmx](https://htmx.org) 2.0.4 (0BSD) and [Cytoscape.js](https://js.cytoscape.org) 3.30.2 (MIT). The embedding model [BAAI/bge-m3](https://huggingface.co/BAAI/bge-m3) (MIT) is downloaded separately.

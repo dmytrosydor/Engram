@@ -35,5 +35,6 @@ fn session_start_text() -> Result<Option<String>> {
         .map_or_else(std::env::current_dir, Ok)?;
     let conn = db::connect(&path)?;
     let space = spaces::resolve(&conn, &cwd)?;
-    Ok(Some(core::get(&conn, &space)?))
+    let text = core::get(&conn, &space)?;
+    Ok((!text.is_empty()).then_some(text))
 }

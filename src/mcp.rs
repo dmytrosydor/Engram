@@ -117,14 +117,16 @@ impl Server {
 impl Server {
     fn do_search(&self, a: SearchArgs) -> Result<String> {
         let conn = db::connect(&self.db)?;
+        let scope = Scope::parse(a.scope.as_deref())?;
+        let spaces = memory::spaces_for(&conn, &self.space, scope)?;
         let vector = embed::embed_one(&a.q).ok();
         let hits = memory::search(
             &conn,
             &Query {
                 text: &a.q,
                 vector: vector.as_deref(),
-                spaces: &self.visible,
-                scope: Scope::parse(a.scope.as_deref())?,
+                spaces: &spaces,
+                scope,
                 kind: a.kind.as_deref(),
                 limit: a.limit.unwrap_or(8).clamp(1, 50),
                 as_of: None,
@@ -227,7 +229,12 @@ async fn run(
 }
 
 pub fn serve() -> Result<()> {
-    let server = Server::new(&std::env::current_dir()?)?;
+    // Claude Code starts the server in the project folder; prefer its explicit hint
+    let dir = match std::env::var_os("CLAUDE_PROJECT_DIR") {
+        Some(d) => std::path::PathBuf::from(d),
+        None => std::env::current_dir()?,
+    };
+    let server = Server::new(&dir)?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;

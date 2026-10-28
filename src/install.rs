@@ -1,4 +1,5 @@
-//! Wiring engram into Claude Code and launchd, and taking it out again.
+//! Wiring engram into Claude Code and the system scheduler (launchd on macOS,
+//! a systemd user timer on Linux), and taking it out again.
 //!
 //! Without `--yes` nothing changes: the plan is printed. Settings are backed up
 //! before they are edited; data in ~/.engram is never touched by uninstall.
@@ -26,6 +27,31 @@ fn plist_path() -> PathBuf {
     home().join(format!("Library/LaunchAgents/{LABEL}.plist"))
 }
 
+fn systemd_dir() -> PathBuf {
+    home().join(".config/systemd/user")
+}
+
+/// Where the hourly `engram daily --if-due` job is registered on this system.
+pub fn scheduler_name() -> String {
+    if cfg!(target_os = "macos") {
+        format!("launchd agent {LABEL}")
+    } else {
+        format!(
+            "systemd user timer engram-daily ({})",
+            systemd_dir().display()
+        )
+    }
+}
+
+/// Whether the daily job is registered.
+pub fn scheduled() -> bool {
+    if cfg!(target_os = "macos") {
+        plist_path().exists()
+    } else {
+        systemd_dir().join("engram-daily.timer").exists()
+    }
+}
+
 /// The binary as invoked; not canonicalised, so a stable symlink (e.g. in
 /// ~/.cargo/bin or /opt/homebrew/bin) survives upgrades.
 fn exe() -> Result<PathBuf> {
@@ -37,7 +63,7 @@ fn shell_quote(p: &Path) -> String {
     format!("'{}'", p.to_string_lossy().replace('\'', r"'\''"))
 }
 
-pub fn install(apply: bool) -> Result<()> {
+pub fn install(apply: bool, daily: bool) -> Result<()> {
     let exe = exe()?;
     if exe.components().any(|c| c.as_os_str() == "target") {
         eprintln!(
@@ -71,7 +97,17 @@ pub fn install(apply: bool) -> Result<()> {
         settings_path().display()
     );
     println!("3. MCP server `engram` (user scope): {} mcp", exe.display());
-    println!("4. launchd agent {LABEL}: hourly `engram daily --if-due` (once a day, on AC power)");
+    if daily {
+        println!(
+            "4. {}: hourly `engram daily --if-due` (once a day, on AC power; runs `claude -p`)",
+            scheduler_name()
+        );
+    } else {
+        println!("4. no daily pass (--no-daily); run `engram daily` by hand when you want one");
+    }
+    for warning in readiness() {
+        println!("   warning: {warning}");
+    }
     if !apply {
         return Ok(());
     }
@@ -97,22 +133,97 @@ pub fn install(apply: bool) -> Result<()> {
             .arg("mcp"))?;
     }
 
-    let path_env = format!(
-        "{}:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin",
-        claude.parent().unwrap_or(Path::new("/usr/bin")).display()
-    );
-    std::fs::create_dir_all(plist_path().parent().context("no LaunchAgents dir")?)?;
-    std::fs::write(plist_path(), plist(&exe, &path_env))?;
-    let target = format!("gui/{}", uid()?);
-    // a previous version may be loaded; replacing it is fine
-    let _ = Command::new("launchctl")
-        .args(["bootout", &format!("{target}/{LABEL}")])
-        .output();
-    run(Command::new("launchctl")
-        .args(["bootstrap", &target])
-        .arg(plist_path()))?;
+    if daily {
+        // schedulers start jobs with a bare PATH; claude and llama-server must resolve
+        let path_env = format!(
+            "{}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin",
+            claude.parent().unwrap_or(Path::new("/usr/bin")).display()
+        );
+        schedule(&exe, &path_env)?;
+    }
     println!("done. Start a new Claude session to get the core; `engram ui` for the web UI.");
     Ok(())
+}
+
+/// What would leave a fresh install half-working.
+fn readiness() -> Vec<String> {
+    let mut out = Vec::new();
+    if !crate::embed::model_path().exists() {
+        out.push(
+            "embedding model missing; run `engram model pull` (search falls back to words only)"
+                .into(),
+        );
+    }
+    if !crate::embed::server_bin().is_file() {
+        out.push(
+            "llama-server not found; install llama.cpp (search falls back to words only)".into(),
+        );
+    }
+    if !db::home().join("spaces.toml").exists() {
+        out.push(
+            "no spaces.toml; run `engram spaces --init` (until then every session is `unsorted`)"
+                .into(),
+        );
+    }
+    out
+}
+
+fn schedule(exe: &Path, path_env: &str) -> Result<()> {
+    if cfg!(target_os = "macos") {
+        std::fs::create_dir_all(plist_path().parent().context("no LaunchAgents dir")?)?;
+        std::fs::write(plist_path(), plist(exe, path_env))?;
+        let target = format!("gui/{}", uid()?);
+        // a previous version may be loaded; replacing it is fine
+        let _ = Command::new("launchctl")
+            .args(["bootout", &format!("{target}/{LABEL}")])
+            .output();
+        run(Command::new("launchctl")
+            .args(["bootstrap", &target])
+            .arg(plist_path()))
+    } else {
+        let dir = systemd_dir();
+        std::fs::create_dir_all(&dir)?;
+        let (service, timer) = systemd_units(exe, path_env);
+        std::fs::write(dir.join("engram-daily.service"), service)?;
+        std::fs::write(dir.join("engram-daily.timer"), timer)?;
+        run(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
+        run(Command::new("systemctl").args(["--user", "enable", "--now", "engram-daily.timer"]))
+    }
+}
+
+fn unschedule() -> Result<()> {
+    if cfg!(target_os = "macos") {
+        let _ = Command::new("launchctl")
+            .args(["bootout", &format!("gui/{}/{LABEL}", uid()?)])
+            .output();
+        let _ = std::fs::remove_file(plist_path());
+    } else {
+        let _ = Command::new("systemctl")
+            .args(["--user", "disable", "--now", "engram-daily.timer"])
+            .output();
+        for unit in ["engram-daily.service", "engram-daily.timer"] {
+            let _ = std::fs::remove_file(systemd_dir().join(unit));
+        }
+        let _ = Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .output();
+    }
+    Ok(())
+}
+
+fn systemd_units(exe: &Path, path_env: &str) -> (String, String) {
+    let log = db::home().join("daily.log");
+    let service = format!(
+        "[Unit]\nDescription=engram daily pass\n\n[Service]\nType=oneshot\n\
+         Environment=PATH={path_env}\nExecStart={exe} daily --if-due\n\
+         StandardOutput=append:{log}\nStandardError=append:{log}\nNice=10\nIOSchedulingClass=idle\n",
+        exe = exe.display(),
+        log = log.display()
+    );
+    let timer = "[Unit]\nDescription=engram daily pass, checked hourly\n\n\
+                 [Timer]\nOnCalendar=hourly\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n"
+        .to_string();
+    (service, timer)
 }
 
 pub fn uninstall(apply: bool) -> Result<()> {
@@ -129,7 +240,7 @@ pub fn uninstall(apply: bool) -> Result<()> {
         settings_path().display()
     );
     println!("2. remove the MCP server `engram`");
-    println!("3. unload and delete {}", plist_path().display());
+    println!("3. remove the {}", scheduler_name());
     println!("   data in {} stays", db::home().display());
     if !apply {
         return Ok(());
@@ -140,10 +251,7 @@ pub fn uninstall(apply: bool) -> Result<()> {
             .args(["mcp", "remove", "engram", "--scope", "user"])
             .output();
     }
-    let _ = Command::new("launchctl")
-        .args(["bootout", &format!("gui/{}/{LABEL}", uid()?)])
-        .output();
-    let _ = std::fs::remove_file(plist_path());
+    unschedule()?;
     println!("done.");
     Ok(())
 }
@@ -227,6 +335,22 @@ pub fn set_hook(settings: &mut Value, command: &str) -> Result<bool> {
         changed = true;
     }
     Ok(changed)
+}
+
+/// Whether ~/.claude/settings.json has engram's SessionStart hook.
+pub fn hook_installed() -> bool {
+    std::fs::read_to_string(settings_path())
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|s| s["hooks"]["SessionStart"].as_array().cloned())
+        .is_some_and(|groups| {
+            groups.iter().any(|g| {
+                g["hooks"].as_array().is_some_and(|hs| {
+                    hs.iter()
+                        .any(|h| h["command"].as_str().is_some_and(is_engram_hook))
+                })
+            })
+        })
 }
 
 fn is_engram_hook(command: &str) -> bool {
@@ -320,6 +444,14 @@ fn run(cmd: &mut Command) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn systemd_units_run_the_daily_pass_hourly() {
+        let (service, timer) = systemd_units(Path::new("/opt/engram"), "/usr/bin:/bin");
+        assert!(service.contains("ExecStart=/opt/engram daily --if-due"));
+        assert!(service.contains("Environment=PATH=/usr/bin:/bin"));
+        assert!(timer.contains("OnCalendar=hourly") && timer.contains("Persistent=true"));
+    }
 
     #[test]
     fn hook_add_is_idempotent_and_remove_keeps_other_hooks() {

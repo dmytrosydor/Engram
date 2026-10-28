@@ -1,7 +1,6 @@
 -- Engram schema. Every statement is idempotent: `engram init` can be re-run safely.
 
 PRAGMA journal_mode = WAL;
-PRAGMA user_version = 1;
 
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 -- Changing the embedding model means re-embedding everything, so it is recorded here.
@@ -12,7 +11,7 @@ INSERT OR IGNORE INTO meta (key, value) VALUES
 -- Spaces: 'global', 'work/acme', 'personal/notes', ...
 CREATE TABLE IF NOT EXISTS space (
   id TEXT PRIMARY KEY,
-  domain TEXT NOT NULL CHECK (domain IN ('global', 'work', 'personal')),
+  domain TEXT NOT NULL CHECK (domain <> ''),  -- any name; 'global' and 'unsorted' are built in
   core TEXT,                           -- prebuilt session-start core, rebuilt by the daily pass
   core_tokens INTEGER,
   core_built_at TEXT

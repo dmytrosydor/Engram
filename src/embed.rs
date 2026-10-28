@@ -1,7 +1,7 @@
-//! Embeddings from a local llama-server (bge-m3, Metal) over a Unix socket.
+//! Embeddings from a local llama-server (bge-m3 on Metal, CUDA or CPU) over a Unix socket.
 //!
 //! The server runs with `--sleep-idle-seconds`, so after 10 idle minutes it unloads
-//! the model and keeps only a small process. If it is not running at all (no launchd
+//! the model and keeps only a small process. If it is not running at all (no scheduler
 //! agent installed), the first request starts it in the background.
 
 use std::fs::File;
@@ -42,10 +42,26 @@ pub fn model_path() -> PathBuf {
     runtime_dir().join("models").join(MODEL_FILE)
 }
 
+/// `$ENGRAM_LLAMA_SERVER`, else `llama-server` from PATH, else the usual install
+/// prefixes (launchd and systemd start jobs with a bare PATH).
 pub fn server_bin() -> PathBuf {
-    std::env::var_os("ENGRAM_LLAMA_SERVER")
+    if let Some(p) = std::env::var_os("ENGRAM_LLAMA_SERVER") {
+        return p.into();
+    }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let home = std::env::var_os("HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/opt/homebrew/bin/llama-server"))
+        .unwrap_or_default();
+    std::env::split_paths(&path)
+        .chain([
+            "/opt/homebrew/bin".into(),
+            "/usr/local/bin".into(),
+            "/usr/bin".into(),
+            home.join(".local/bin"),
+        ])
+        .map(|dir| dir.join("llama-server"))
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| PathBuf::from("llama-server"))
 }
 
 /// llama-server arguments, shared by the launchd agent and the on-demand start.
