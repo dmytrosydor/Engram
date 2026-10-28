@@ -337,7 +337,8 @@ pub fn get(conn: &Connection, ids: &[i64], session: &str) -> Result<String> {
     Ok(out.join("\n\n"))
 }
 
-fn links(conn: &Connection, id: i64) -> Result<Vec<String>> {
+/// Confirmed links of an item, as `type #id` / `#id type this`.
+pub fn links(conn: &Connection, id: i64) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(
         "SELECT type, dst, 1 FROM edge WHERE src = ?1 AND confirmed = 1
          UNION ALL SELECT type, src, 0 FROM edge WHERE dst = ?1 AND confirmed = 1",

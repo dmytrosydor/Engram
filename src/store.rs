@@ -188,3 +188,54 @@ pub fn set_status(
         Some(&after),
     )
 }
+
+/// Edits an item by hand (UI). Changing title or body drops its vector until
+/// the caller re-embeds it.
+pub fn edit(
+    conn: &Connection,
+    id: i64,
+    title: &str,
+    body: &str,
+    kind: &str,
+    space: &str,
+    actor: &str,
+) -> Result<bool> {
+    if !KINDS.contains(&kind) {
+        anyhow::bail!("unknown kind {kind}");
+    }
+    let before = item_json(conn, id)?;
+    let text_changed = before["title"] != title || before["body"] != body;
+    conn.execute(
+        "UPDATE item SET title = ?2, body = ?3, kind = ?4, space_id = ?5, content_hash = ?6, updated_at = ?7
+         WHERE id = ?1",
+        params![id, title, body, kind, space, content_hash(body), now(conn)?],
+    )?;
+    if text_changed {
+        conn.execute("DELETE FROM item_vec WHERE item_id = ?1", [id])?;
+    }
+    log(
+        conn,
+        actor,
+        "edit",
+        Some(id),
+        Some(&before),
+        Some(&item_json(conn, id)?),
+    )?;
+    Ok(text_changed)
+}
+
+pub fn set_pinned(conn: &Connection, id: i64, pinned: bool, actor: &str) -> Result<()> {
+    let before = item_json(conn, id)?;
+    conn.execute(
+        "UPDATE item SET pinned = ?2, updated_at = ?3 WHERE id = ?1",
+        params![id, pinned, now(conn)?],
+    )?;
+    log(
+        conn,
+        actor,
+        if pinned { "pin" } else { "unpin" },
+        Some(id),
+        Some(&before),
+        Some(&item_json(conn, id)?),
+    )
+}

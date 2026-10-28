@@ -83,6 +83,11 @@ enum Cmd {
     /// The review queue
     #[command(subcommand)]
     Review(ReviewCmd),
+    /// Local web UI on 127.0.0.1
+    Ui {
+        #[arg(long, default_value_t = 7777)]
+        port: u16,
+    },
     /// Search quality on (query -> opened record) pairs from past sessions
     #[command(subcommand)]
     Eval(EvalCmd),
@@ -348,6 +353,10 @@ fn main() -> Result<ExitCode> {
                 let (q, leaks) = eval::isolation(&conn, &pairs, &dirs[0], &dirs[1])?;
                 println!("isolation: {q} searches, {leaks} results from the other domain");
             }
+            Ok(ExitCode::SUCCESS)
+        }
+        Cmd::Ui { port } => {
+            engram::ui::serve(port)?;
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Review(cmd) => {
