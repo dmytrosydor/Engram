@@ -170,3 +170,59 @@ fn session_start_hook_prints_the_folder_core() {
     // garbage input still exits 0
     run("not json");
 }
+
+#[test]
+fn stale_state_leaves_often_opened_and_state_expires_by_default() {
+    let (_d, conn) = setup();
+    let fact = put(&conn, "work/acme", "fact", "Stand is on port 8080", None);
+    let checkpoint = put(&conn, "work/acme", "state", "Night block checkpoint", None);
+    let until: Option<String> = conn
+        .query_row(
+            "SELECT valid_until FROM item WHERE id = ?1",
+            [checkpoint],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let in_30: String = conn
+        .query_row("SELECT date('now', '+30 days')", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        until.as_deref(),
+        Some(in_30.as_str()),
+        "state gets a 30-day end"
+    );
+    let unchanged: Option<String> = conn
+        .query_row("SELECT valid_until FROM item WHERE id = ?1", [fact], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(unchanged, None, "other kinds keep no end date");
+
+    // both opened often, the checkpoint written ten days ago
+    conn.execute(
+        "UPDATE item SET hits = 9, created_at = datetime('now', '-10 days'), updated_at = NULL
+         WHERE id = ?1",
+        [checkpoint],
+    )
+    .unwrap();
+    conn.execute("UPDATE item SET hits = 3 WHERE id = ?1", [fact])
+        .unwrap();
+    let unreviewed = put(
+        &conn,
+        "work/acme",
+        "fact",
+        "Imported, nobody checked it",
+        None,
+    );
+    conn.execute(
+        "UPDATE item SET hits = 20, status = 'proposed' WHERE id = ?1",
+        [unreviewed],
+    )
+    .unwrap();
+    let text = core::build(&conn, "work/acme").unwrap();
+    let often = &text[text.find("often opened").expect("section")..];
+    assert!(often.contains(&format!("#{fact} ")));
+    assert!(!often.contains(&format!("#{checkpoint} ")), "{text}");
+    assert!(!often.contains(&format!("#{unreviewed} ")), "{text}");
+    assert!(text.contains("? after the kind = not reviewed yet"));
+}

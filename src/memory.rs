@@ -526,6 +526,14 @@ pub fn write(conn: &Connection, w: &Write, actor: &str) -> Result<Written> {
         set_vector(&tx, id, w.vector)?;
         Written::Updated(id)
     } else {
+        // state written without an end date still expires, so it cannot linger forever
+        let valid_until = match (w.valid_until, w.kind) {
+            (Some(d), _) => Some(d.to_string()),
+            (None, "state") => {
+                Some(tx.query_row("SELECT date('now', '+30 days')", [], |r| r.get(0))?)
+            }
+            (None, _) => None,
+        };
         let item = NewItem {
             space_id: w.space.into(),
             kind: w.kind.into(),
@@ -533,7 +541,7 @@ pub fn write(conn: &Connection, w: &Write, actor: &str) -> Result<Written> {
             body: body.into(),
             status: w.status.into(),
             source: w.source.map(str::to_string),
-            valid_until: w.valid_until.map(str::to_string),
+            valid_until,
             ..NewItem::default()
         };
         match store::insert_item(&tx, &item, actor)? {

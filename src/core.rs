@@ -48,8 +48,12 @@ const SECTIONS: [Section; 4] = [
     },
     Section {
         title: "often opened",
-        sql: "SELECT * FROM v WHERE hits > 0
-              AND (status = 'active' OR (status = 'proposed' AND space_id = :space))
+        // popularity alone must not lift unreviewed imports into every session start, and
+        // state and events go stale: a week-old checkpoint is noise however often it was read
+        sql: "SELECT * FROM v WHERE hits > 0 AND status = 'active'
+              AND (pinned = 1 OR kind NOT IN ('state', 'event')
+                   OR (julianday(:today) - julianday(COALESCE(updated_at, created_at)) <= 7
+                       AND (valid_until IS NULL OR valid_until >= :today)))
               ORDER BY hits DESC, last_hit DESC",
         limit: 10,
     },
@@ -61,7 +65,7 @@ pub fn build(conn: &Connection, space: &str) -> Result<String> {
     let today = store::today(conn)?;
     let mut text = format!(
         "engram memory · space {space} (sees {}) · tools: search / get / write\n\
-         line = #id kind space date | title; kinds r rule p pref d decision f fact g gotcha l lesson s state t task",
+         line = #id kind space date | title; kinds r rule p pref d decision f fact g gotcha l lesson s state t task; ? after the kind = not reviewed yet",
         visible[1..].join(", ")
     );
     let mut seen = std::collections::HashSet::new();
