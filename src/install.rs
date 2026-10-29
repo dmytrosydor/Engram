@@ -141,7 +141,9 @@ pub fn install(apply: bool, daily: bool) -> Result<()> {
         );
         schedule(&exe, &path_env)?;
     }
-    println!("done. Start a new Claude session to get the core; `engram ui` for the web UI.");
+    println!(
+        "done. Start a new Claude session to get the core; `engram` opens the memory map and review queue."
+    );
     Ok(())
 }
 

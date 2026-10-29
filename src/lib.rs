@@ -16,4 +16,4 @@ pub mod setup;
 pub mod spaces;
 pub mod store;
 pub mod transcript;
-pub mod ui;
+pub mod tui;

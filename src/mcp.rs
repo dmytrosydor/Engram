@@ -196,7 +196,7 @@ impl Server {
                 "open",
             )?;
             msg.push_str(
-                " (global: waits for review in engram ui before it reaches every session)",
+                " (global: waits for review in the engram queue before it reaches every session)",
             );
         }
         Ok(msg)

@@ -10,7 +10,7 @@ Local long-term memory for [Claude Code](https://code.claude.com). One Rust bina
 - **Search, get, write over MCP.** Claude looks things up on demand. Hybrid search combines two FTS5 indexes and vector search (bge-m3, multilingual), takes ~30 ms, and needs no API key.
 - **Isolation enforced in code, not in a prompt.** Folders map to spaces, and spaces belong to domains such as `work` and `personal`. A session can only read and change its own domain plus a `global` space (details below).
 - **You approve what it learns.** Once a day a background pass proposes merges of near-duplicates and new knowledge from your recent sessions. Nothing lands in memory until you accept it in the review queue.
-- **A local web UI** at `127.0.0.1:7777`: what Claude gets for a folder, the review queue, a feed, a map of spaces and links, the recall log and health.
+- **A terminal UI.** Run `engram` with no arguments: a node map of your domains and spaces sized by how much each holds, a space's records, the review queue and search.
 
 ## Quickstart
 
@@ -43,7 +43,7 @@ Claude ──MCP──► search / get / write ──► ~/.engram/engram.db
                                           ▲
                      llama-server (bge-m3) ┘  on demand over a Unix socket, sleeps when idle
 
-hourly job ──► engram daily --if-due ──► claude -p (no tools) ──► review queue ──► you, in the UI
+hourly job ──► engram daily --if-due ──► claude -p (no tools) ──► review queue ──► you, in `engram`
 ```
 
 - **Records** are short, typed and dated: `rule`, `preference`, `decision`, `fact`, `gotcha`, `lesson`, `state`, `task`, `person`, `event`. Titles are ≤ 120 characters and bodies ≤ 1,500.
@@ -73,7 +73,7 @@ The code guarantees the following:
 
 - **What a session sees.** A session in space `S` of domain `D` sees `S`, `D/_shared` and `global`. With `scope: "all"` it sees every space of `D` plus `global`. A session in `unsorted` sees only `unsorted` and `global`.
 - **`get`** returns "not found" for records outside those spaces.
-- **`write`** refuses to target a space the session cannot see. `update` and `supersede` work only on records the session can see, and never on `global` records, which change only through the review queue or the UI.
+- **`write`** refuses to target a space the session cannot see. `update` and `supersede` work only on records the session can see, and never on `global` records, which change only through the review queue.
 - **Writes to `global`** are stored as unreviewed and reach other sessions' cores only after you accept them.
 - **Duplicate detection** works within one space. Writing text that happens to exist in another domain neither fails nor reveals that the other copy exists.
 - **Links** returned by `get` leave out records the session cannot see.
@@ -81,9 +81,49 @@ The code guarantees the following:
 
 What is **not** isolated:
 
-- **The web UI** shows every domain. It listens only on `127.0.0.1` and rejects cross-site and DNS-rebinding requests, but it has no login.
+- **The terminal UI and the CLI** show every domain: they are you, not a session.
 - **The database file** is readable by your user account.
 - **The daily pass sends text to Claude.** It runs `claude -p`, which sends the transcript excerpts and records it is judging to Anthropic, the same way your normal Claude Code sessions do. Use `engram install --yes --no-daily` to skip it.
+
+## Terminal UI
+
+```
+ engram  1 map  2 queue  3 search    1045 records · 9 spaces · 0 to review
+╭ memory map ──────────────────────────────────────────────────────────╮╭ selected ──────────────────────────╮
+│                                                                      ││work/acme-web                       │
+│                                                                      ││space in work                       │
+│          shared 8  ⣀⡀                          ⣠⣤billing 90          ││                                    │
+│                    ⠛⠃                          ⠿⠿⠃                   ││active     ██████████████ 420       │
+│                     ⢇                          ⡸                     ││unreviewed ░░░░░░░░░░░░░░ 0         │
+│                     ⠸⡀                         ⡇                     ││archived   ░░░░░░░░░░░░░░ 0         │
+│                      ⡇                        ⢸                      ││                                    │
+│                      ⢸                        ⡇                      ││last write 2026-10-29               │
+│       blog 60 ⢀⣤⣄     ⡇                      ⢰⠁   ⣴⣿⣿⣷acme-web 420   ││sees       work/_shared, global     │
+│               ⠘⠿⠟⡀    ⢸                      ⡎    ⢿⣿⣿⣿⠇              ││                                    │
+│                  ⠈⠑⢄  ⠈⡆                    ⢰⠁  ⢀⠔⠁⠉⠉⠁               ││recent                              │
+│                     ⠑⢄⡀⢱                    ⡜ ⡠⠊⠁                    ││· work/acme-web note 0              │
+│               personal⠈⢀⣤⣀⣀⣀⣀⡀   ⣠⣄        ⣤work                     ││· work/acme-web note 1              │
+│                       ⡠⠈⠛    global 12⠉⠉⠉⠉⠉⠛⠁⡀                       ││· work/acme-web note 2              │
+│                    ⢀⡠⠊ ⡜                    ⢇⠈⠑⢄                     ││· work/acme-web note 3              │
+│                  ⢀⠔⠁  ⢀⠇                    ⠸⡀  ⠑⢄⡀                  ││· work/acme-web note 4              │
+│       game 25  ⣤⡄⠁    ⡸                      ⡇    ⢠⣶⣷acme-api 260    ││· work/acme-web note 5              │
+│                ⠉⠁     ⡇                      ⢸    ⠈⠻⠿⠃               ││                                    │
+│                      ⢸                        ⡇                      ││                                    │
+│                      ⡇                        ⢸                      ││                                    │
+│                     ⢸                         ⠈⡆                     ││                                    │
+│                     ⡎                          ⢱                     ││                                    │
+│         notes 140 ⢰⣶⣶                          ⢰⣦shared 30           ││                                    │
+│                   ⠈⠛⠋                          ⠈⠉                    ││                                    │
+│                                                                      ││                                    │
+│                                                                      ││                                    │
+╰──────────────────────────────────────────────────────────────────────╯╰────────────────────────────────────╯
+ ←↑↓→ move · enter open · / search · tab queue · q quit
+```
+
+- **Map:** `global` in the middle, a hub per domain, its spaces around it. Node size follows the number of records; lines between spaces are confirmed links. Arrows move between nodes, Enter opens a space.
+- **Space:** its records, newest first, with the full text. `p` pins, `a` archives or restores.
+- **Queue:** proposals headed for `global` first, since every session would see them. `y` accepts, `n` rejects.
+- **Search:** searches as a session in the selected space would.
 
 ## Daily pass
 
@@ -96,7 +136,7 @@ The scheduled job runs at most once a day, only on AC power. It:
 5. turns notes from `engram add "…"` and files dropped in `~/.engram/inbox/` into proposals;
 6. rebuilds every core.
 
-With the default limits a run makes up to about 15 `claude -p` calls on Sonnet. They count against your Claude Code plan, or are billed to your API key if you use one. Set `ENGRAM_DAILY_MODEL` to choose another model. Run it by hand with `engram daily`. The last run and its errors show on the UI health page and in `engram doctor`.
+With the default limits a run makes up to about 15 `claude -p` calls on Sonnet. They count against your Claude Code plan, or are billed to your API key if you use one. Set `ENGRAM_DAILY_MODEL` to choose another model. Run it by hand with `engram daily`. The last run and its errors show in `engram doctor`.
 
 ## Resources
 
@@ -136,7 +176,7 @@ After an import, `engram reindex` computes the vectors. That takes about 5 minut
 | `engram review list \| accept <id> \| reject <id>` | the review queue |
 | `engram move --to <space> <id>…` | move records to another space |
 | `engram daily` | run the daily pass now |
-| `engram ui [--port 7777]` | the web UI |
+| `engram` | the terminal UI (also `engram tui`) |
 | `engram eval extract && engram eval run` | search quality on your own past sessions (Memora history) |
 | `engram uninstall --yes` | remove hook, MCP server and schedule; data stays |
 
@@ -175,4 +215,4 @@ cargo clippy --all-targets
 
 ## License
 
-MIT, see [LICENSE](LICENSE). Bundled in the binary: [htmx](https://htmx.org) 2.0.4 (0BSD) and [Cytoscape.js](https://js.cytoscape.org) 3.30.2 (MIT). The embedding model [BAAI/bge-m3](https://huggingface.co/BAAI/bge-m3) (MIT) is downloaded separately.
+MIT, see [LICENSE](LICENSE). The embedding model [BAAI/bge-m3](https://huggingface.co/BAAI/bge-m3) (MIT) is downloaded separately.

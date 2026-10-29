@@ -12,8 +12,9 @@ use engram::{core, daily, db, embed, eval, import, index, memory, review, spaces
     about = "Local long-term memory for Claude Code"
 )]
 struct Cli {
+    /// Without a command the terminal UI opens
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
@@ -114,11 +115,8 @@ enum Cmd {
         #[arg(long)]
         yes: bool,
     },
-    /// Local web UI on 127.0.0.1
-    Ui {
-        #[arg(long, default_value_t = 7777)]
-        port: u16,
-    },
+    /// The terminal UI: memory map, a space's records, the review queue, search
+    Tui,
     /// Search quality on (query -> opened record) pairs from past sessions
     #[command(subcommand)]
     Eval(EvalCmd),
@@ -198,7 +196,7 @@ enum ImportCmd {
 }
 
 fn main() -> Result<ExitCode> {
-    match Cli::parse().cmd {
+    match Cli::parse().cmd.unwrap_or(Cmd::Tui) {
         Cmd::Init => init(),
         Cmd::Info => info(),
         Cmd::Embed { texts } => embed(&texts),
@@ -471,8 +469,8 @@ fn main() -> Result<ExitCode> {
             engram::install::uninstall(yes)?;
             Ok(ExitCode::SUCCESS)
         }
-        Cmd::Ui { port } => {
-            engram::ui::serve(port)?;
+        Cmd::Tui => {
+            engram::tui::run()?;
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Review(cmd) => {
