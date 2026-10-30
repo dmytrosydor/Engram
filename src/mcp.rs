@@ -147,6 +147,11 @@ impl Server {
         let conn = db::connect(&self.db)?;
         let space = a.space.as_deref().unwrap_or(&self.space);
         let vector = embed::embed_one(&index::item_text(a.title.trim(), a.body.trim())).ok();
+        // looked up before the write so the new record cannot match itself
+        let related = match &vector {
+            Some(v) => memory::related(&conn, v, &self.visible)?,
+            None => Vec::new(),
+        };
         let written = memory::write(
             &conn,
             &Write {
@@ -183,6 +188,16 @@ impl Server {
             }
         }
         let mut msg = written.message();
+        if matches!(written, memory::Written::Created(_)) && !related.is_empty() {
+            msg.push_str("\nolder records on the same topic, check they still hold:");
+            for (hit, cos) in &related {
+                msg.push_str(&format!("\n{} (cos {cos:.2})", hit.line()));
+            }
+            msg.push_str(
+                "\nif the new record makes one wrong, repeat this write with mode=\"supersede:<id>\"; \
+                 a session cannot change global records, so tell the user about those",
+            );
+        }
         if space == "global"
             && let memory::Written::Created(id) | memory::Written::Superseded { new: id, .. } =
                 written

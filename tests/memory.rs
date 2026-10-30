@@ -423,3 +423,104 @@ fn sessions_cannot_touch_or_read_other_domains() {
         assert!(memory::write(&conn, &w, "t").is_err(), "{mode} on global");
     }
 }
+
+/// Unit vector with the given cosine to `axis(0)`.
+fn at_cos(cos: f32) -> Vec<f32> {
+    let mut v = vec![0f32; 1024];
+    v[0] = cos;
+    v[1] = (1.0 - cos * cos).sqrt();
+    v
+}
+
+#[test]
+fn related_lists_same_topic_records_that_write_would_not_refuse() {
+    let (_d, conn) = setup();
+    let vis = visible(&conn, "work/acme");
+    let write = |space: &str, title: &str, v: Vec<f32>| {
+        memory::write(
+            &conn,
+            &Write {
+                kind: "fact",
+                title,
+                body: title,
+                space,
+                source: None,
+                valid_until: None,
+                mode: Some("add"),
+                vector: Some(&v),
+                visible: &visible(&conn, space),
+                status: "active",
+            },
+            "test",
+        )
+        .unwrap()
+    };
+    let Written::Created(topic) = write("work/acme", "Laptop is a 2017 MacBook", at_cos(0.80))
+    else {
+        panic!()
+    };
+    write("work/acme", "Too close, write refuses it", at_cos(0.95));
+    write("work/acme", "Unrelated", at_cos(0.40));
+    write("global", "Global on the same topic", at_cos(0.80));
+    write(
+        "personal/side",
+        "Other domain on the same topic",
+        at_cos(0.80),
+    );
+
+    let found = memory::related(&conn, &axis(0), &vis).unwrap();
+    let mut titles: Vec<&str> = found.iter().map(|(h, _)| h.title.as_str()).collect();
+    titles.sort();
+    assert_eq!(
+        titles,
+        ["Global on the same topic", "Laptop is a 2017 MacBook"],
+        "visible same-topic records only"
+    );
+    assert!(found.iter().any(|(h, _)| h.id == topic));
+}
+
+#[test]
+fn supersede_retires_the_old_record_even_if_the_new_text_is_already_stored() {
+    let (_d, conn) = setup();
+    let vis = visible(&conn, "work/acme");
+    let write = |title: &str, mode: Option<&str>| {
+        memory::write(
+            &conn,
+            &Write {
+                kind: "fact",
+                title,
+                body: title,
+                space: "work/acme",
+                source: None,
+                valid_until: None,
+                mode,
+                vector: None,
+                visible: &vis,
+                status: "active",
+            },
+            "test",
+        )
+        .unwrap()
+    };
+    let Written::Created(old) = write("Laptop is a 2017 MacBook", Some("add")) else {
+        panic!()
+    };
+    let Written::Created(new) = write("Laptop is a new MacBook", Some("add")) else {
+        panic!()
+    };
+    let mode = format!("supersede:{old}");
+    match write("Laptop is a new MacBook", Some(&mode)) {
+        Written::Superseded { new: n, old: o } => assert_eq!((n, o), (new, old)),
+        other => panic!("{other:?}"),
+    }
+    let status: String = conn
+        .query_row("SELECT status FROM item WHERE id = ?1", [old], |r| r.get(0))
+        .unwrap();
+    assert_eq!(status, "superseded");
+    // a record cannot retire itself
+    let own = format!("supersede:{new}");
+    assert!(matches!(
+        write("Laptop is a new MacBook", Some(&own)),
+        Written::Exists(_)
+    ));
+}

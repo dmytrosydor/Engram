@@ -19,6 +19,9 @@ const KNN_POOLS: [usize; 2] = [400, 4096];
 const RRF_K: f64 = 60.0;
 /// Cosine at or above which `write` asks before adding.
 pub const SIMILAR: f32 = 0.88;
+/// Cosine from which an older record is probably about the same topic
+/// (bge-m3: same-topic pairs measured 0.59-0.73, unrelated ones up to about 0.55).
+pub const RELATED: f32 = 0.58;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Scope {
@@ -482,7 +485,7 @@ pub fn write(conn: &Connection, w: &Write, actor: &str) -> Result<Written> {
         match target {
             // every session sees global items, so one session must not rewrite or retire them
             Some((space, _)) if space == "global" && w.space != "global" => {
-                bail!("#{id} is in global; change it in the review queue or the web UI")
+                bail!("#{id} is in global; change it in the terminal UI")
             }
             Some((space, status))
                 if w.visible.contains(&space) && (status == "active" || status == "proposed") => {}
@@ -545,16 +548,19 @@ pub fn write(conn: &Connection, w: &Write, actor: &str) -> Result<Written> {
             ..NewItem::default()
         };
         match store::insert_item(&tx, &item, actor)? {
-            Inserted::Duplicate(id) => Written::Exists(id),
+            // the new text is already stored: the old record can still retire in its favour
+            Inserted::Duplicate(id) => match supersede.filter(|&old| old != id) {
+                Some(old) => {
+                    retire(&tx, old, id, actor)?;
+                    Written::Superseded { new: id, old }
+                }
+                None => Written::Exists(id),
+            },
             Inserted::New(id) => {
                 set_vector(&tx, id, w.vector)?;
                 match supersede {
                     Some(old) => {
-                        store::set_status(&tx, old, "superseded", Some(id), actor)?;
-                        tx.execute(
-                            "INSERT OR IGNORE INTO edge (src, dst, type, confirmed) VALUES (?1, ?2, 'supersedes', 1)",
-                            params![id, old],
-                        )?;
+                        retire(&tx, old, id, actor)?;
                         Written::Superseded { new: id, old }
                     }
                     None => Written::Created(id),
@@ -564,6 +570,15 @@ pub fn write(conn: &Connection, w: &Write, actor: &str) -> Result<Written> {
     };
     tx.commit()?;
     Ok(result)
+}
+
+fn retire(conn: &Connection, old: i64, new: i64, actor: &str) -> Result<()> {
+    store::set_status(conn, old, "superseded", Some(new), actor)?;
+    conn.execute(
+        "INSERT OR IGNORE INTO edge (src, dst, type, confirmed) VALUES (?1, ?2, 'supersedes', 1)",
+        params![new, old],
+    )?;
+    Ok(())
 }
 
 fn set_vector(conn: &Connection, id: i64, v: Option<&[f32]>) -> Result<()> {
@@ -579,6 +594,23 @@ fn set_vector(conn: &Connection, id: i64, v: Option<&[f32]>) -> Result<()> {
 
 /// Visible live items with cosine >= SIMILAR to `v`, best first.
 pub fn similar(conn: &Connection, v: &[f32], spaces: &[String]) -> Result<Vec<(Hit, f32)>> {
+    Ok(closest(conn, v, spaces)?
+        .into_iter()
+        .filter(|(_, c)| *c >= SIMILAR)
+        .collect())
+}
+
+/// Older records on the same topic as `v` that a new one may have made outdated:
+/// close, but not close enough for `write` to refuse.
+pub fn related(conn: &Connection, v: &[f32], spaces: &[String]) -> Result<Vec<(Hit, f32)>> {
+    Ok(closest(conn, v, spaces)?
+        .into_iter()
+        .filter(|(_, c)| (RELATED..SIMILAR).contains(c))
+        .collect())
+}
+
+/// The closest live items to `v` in `spaces`, best first.
+fn closest(conn: &Connection, v: &[f32], spaces: &[String]) -> Result<Vec<(Hit, f32)>> {
     let q = Query {
         text: "",
         vector: Some(v),
@@ -612,11 +644,7 @@ pub fn similar(conn: &Connection, v: &[f32], spaces: &[String]) -> Result<Vec<(H
             r.get::<_, f64>(6)? as f32,
         ))
     })?;
-    Ok(rows
-        .collect::<rusqlite::Result<Vec<_>>>()?
-        .into_iter()
-        .filter(|(_, c)| *c >= SIMILAR)
-        .collect())
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 #[cfg(test)]
