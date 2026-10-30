@@ -226,7 +226,7 @@ fn daily_pass_end_to_end_with_a_fake_model() {
         (0, 0, 0)
     );
     assert_eq!(fake.asked.borrow().len(), asked_before);
-    assert!(daily::not_due(&conn).unwrap().is_some());
+    assert!(daily::not_due(&conn, true).unwrap().is_some());
 }
 
 #[test]
@@ -285,4 +285,32 @@ fn bad_transcripts_are_skipped_and_the_rest_wait_for_the_next_run() {
         (1, 0),
         "s2 picked up, nothing repeated"
     );
+}
+
+#[test]
+fn default_pass_archives_expired_state_and_runs_once_a_day_without_a_model() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("engram.db");
+    db::init(&path).unwrap();
+    let conn = db::connect(&path).unwrap();
+    std::fs::write(dir.path().join("spaces.toml"), SPACES).unwrap();
+    spaces::load(&conn, &dir.path().join("spaces.toml")).unwrap();
+
+    let old = put(&conn, "state", "Old checkpoint", Some("2020-01-01"), None);
+    let open = put(&conn, "state", "Open checkpoint", Some("2999-01-01"), None);
+    let fact = put(&conn, "fact", "Stand is on port 8080", None, None);
+
+    assert!(daily::not_due(&conn, false).unwrap().is_none());
+    let r = daily::tidy(&conn, |_| {}).unwrap();
+    assert_eq!(r.expired, 1);
+    assert!(r.cores > 0);
+    assert_eq!(status(&conn, old).0, "archived");
+    assert_eq!(status(&conn, open).0, "active");
+    assert_eq!(status(&conn, fact).0, "active");
+
+    assert!(daily::not_due(&conn, false).unwrap().is_some());
+    let queue: i64 = conn
+        .query_row("SELECT count(*) FROM review", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(queue, 0, "the default pass queues nothing");
 }

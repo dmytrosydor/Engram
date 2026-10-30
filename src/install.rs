@@ -99,7 +99,7 @@ pub fn install(apply: bool, daily: bool) -> Result<()> {
     println!("3. MCP server `engram` (user scope): {} mcp", exe.display());
     if daily {
         println!(
-            "4. {}: hourly `engram daily --if-due` (once a day, on AC power; runs `claude -p`)",
+            "4. {}: hourly `engram daily --if-due` (once a day; no model calls)",
             scheduler_name()
         );
     } else {

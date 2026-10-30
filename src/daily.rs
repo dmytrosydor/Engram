@@ -1,9 +1,10 @@
-//! The daily pass: expire old state, find near-duplicates, classify unreviewed
-//! imports, and extract new knowledge from transcripts and the inbox.
+//! The daily pass. By default it only tidies, with no model: expired state goes to
+//! the archive and every core is rebuilt.
 //!
-//! Deterministic steps apply on their own. Model judgements on imported items are
-//! applied too (logged, so reversible); everything new or destructive goes to the
-//! review queue.
+//! `--with-claude` adds the judgement steps: find near-duplicates, classify unreviewed
+//! imports, and extract new knowledge from transcripts and the inbox. Model judgements
+//! on imported items apply directly (logged, so reversible); everything new or
+//! destructive goes to the review queue.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -132,11 +133,12 @@ pub struct Report {
 }
 
 /// Why the scheduled run should not start now, if it should not.
-pub fn not_due(conn: &Connection) -> Result<Option<String>> {
+/// Only a run that calls the model waits for AC power; tidying costs nothing.
+pub fn not_due(conn: &Connection, with_claude: bool) -> Result<Option<String>> {
     if meta(conn, "daily_last_run")?.as_deref() == Some(&store::today(conn)?) {
         return Ok(Some("already ran today".into()));
     }
-    if !on_ac_power() {
+    if with_claude && !on_ac_power() {
         return Ok(Some("on battery".into()));
     }
     Ok(None)
@@ -164,19 +166,45 @@ fn on_ac_power() -> bool {
     mains.is_empty() || mains.iter().any(|p| read(p.join("online")).trim() == "1")
 }
 
+/// The model-free pass: archive expired state and rebuild every core.
+pub fn tidy(conn: &Connection, mut say: impl FnMut(&str)) -> Result<Report> {
+    let _lock = lock(conn)?;
+    let mut r = Report {
+        expired: expire(conn)?,
+        ..Report::default()
+    };
+    say(&format!("expired {}", r.expired));
+    r.cores = core::rebuild_all(conn)?.len();
+    set_meta(conn, "daily_last_run", &store::today(conn)?)?;
+    set_meta(conn, "daily_last_errors", "")?;
+    store::log(
+        conn,
+        ACTOR,
+        "daily",
+        None,
+        None,
+        Some(&json!(format!("{r:?}"))),
+    )?;
+    Ok(r)
+}
+
+/// One run at a time per database (scheduled tick vs a manual run).
+fn lock(conn: &Connection) -> Result<std::fs::File> {
+    let lock_path = format!("{}.daily.lock", conn.path().unwrap_or("engram"));
+    let lock = std::fs::File::create(&lock_path)?;
+    if lock.try_lock().is_err() {
+        bail!("another daily run is in progress");
+    }
+    Ok(lock)
+}
+
 pub fn run(
     conn: &Connection,
     llm: &dyn Llm,
     opts: &Options,
     mut say: impl FnMut(&str),
 ) -> Result<Report> {
-    // one run at a time per database (launchd tick vs a manual run)
-    let lock_path = format!("{}.daily.lock", conn.path().unwrap_or("engram"));
-    let lock = std::fs::File::create(&lock_path)?;
-    if lock.try_lock().is_err() {
-        bail!("another daily run is in progress");
-    }
-
+    let _lock = lock(conn)?;
     let mut r = Report::default();
     let started = store::now(conn)?;
     let started_ns = SystemTime::now()

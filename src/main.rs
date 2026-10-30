@@ -69,11 +69,14 @@ enum Cmd {
         #[arg(long)]
         all: bool,
     },
-    /// Daily pass: expire state, queue merges, classify imports, read new transcripts
+    /// Daily pass: archive expired state and rebuild cores; no model unless --with-claude
     Daily {
-        /// Exit quietly unless the scheduled run is due (once a day, on AC power)
+        /// Exit quietly unless the scheduled run is due (once a day)
         #[arg(long)]
         if_due: bool,
+        /// Also ask Claude: queue merges, classify imports, read new transcripts and notes
+        #[arg(long)]
+        with_claude: bool,
         /// Unreviewed imported items to classify
         #[arg(long, default_value_t = 120)]
         classify: usize,
@@ -84,7 +87,7 @@ enum Cmd {
         #[arg(long, default_value_t = 40)]
         pairs: usize,
     },
-    /// Drop a note into the inbox for the next daily pass
+    /// Drop a note into the inbox for the next `engram daily --with-claude`
     Add {
         text: String,
         /// Space for the note (default: the current folder's)
@@ -106,7 +109,7 @@ enum Cmd {
         /// Apply; without it only the plan is printed
         #[arg(long)]
         yes: bool,
-        /// Skip the scheduled daily pass (it calls `claude -p`)
+        /// Skip the scheduled daily pass
         #[arg(long)]
         no_daily: bool,
     },
@@ -364,13 +367,18 @@ fn main() -> Result<ExitCode> {
         }
         Cmd::Daily {
             if_due,
+            with_claude,
             classify,
             transcripts,
             pairs,
         } => {
             let conn = open()?;
-            if if_due && let Some(why) = daily::not_due(&conn)? {
+            if if_due && let Some(why) = daily::not_due(&conn, with_claude)? {
                 eprintln!("daily: skipped ({why})");
+                return Ok(ExitCode::SUCCESS);
+            }
+            if !with_claude {
+                daily::tidy(&conn, |s| eprintln!("daily: {s}"))?;
                 return Ok(ExitCode::SUCCESS);
             }
             let home = std::env::var("HOME").unwrap_or_default();
@@ -405,7 +413,7 @@ fn main() -> Result<ExitCode> {
                 None => spaces::resolve(&conn, &std::env::current_dir()?)?,
             };
             let id = daily::add_note(&conn, &space, &text, "note:cli")?;
-            println!("inbox #{id} ({space}); processed by the next daily pass");
+            println!("inbox #{id} ({space}); processed by the next `engram daily --with-claude`");
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Move { to, ids } => {
