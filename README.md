@@ -9,17 +9,19 @@ Local long-term memory for [Claude Code](https://code.claude.com). One Rust bina
 - **A small core at every session start.** A `SessionStart` hook adds, in about a millisecond, a short summary of what matters in the current project (≤ 6,000 characters): rules and preferences, current state, recent decisions, what gets opened most. It does not dump all of memory into the context.
 - **Search, get, write over MCP.** Claude looks things up on demand. Hybrid search combines two FTS5 indexes and vector search (bge-m3, multilingual), takes ~30 ms, and needs no API key.
 - **Isolation enforced in code, not in a prompt.** Folders map to spaces, and spaces belong to domains such as `work` and `personal`. A session can only read and change its own domain plus a `global` space (details below).
-- **You approve what it learns.** Once a day a background pass proposes merges of near-duplicates and new knowledge from your recent sessions. Nothing lands in memory until you accept it in the review queue.
+- **It looks after itself.** Claude writes what is worth keeping during the session, and each new record comes back with older ones on the same topic, so outdated facts get replaced on the spot. Expired state is archived daily with no model calls and nothing for you to review.
 - **A terminal UI.** Run `engram` with no arguments: a node map of your domains and spaces sized by how much each holds, a space's records, the review queue and search.
 
 ## Quickstart
 
-You need macOS or Linux, [Rust](https://rustup.rs) 1.89+, [llama.cpp](https://github.com/ggml-org/llama.cpp) (for `llama-server`), the `claude` CLI and `curl`.
+You need macOS or Linux, [llama.cpp](https://github.com/ggml-org/llama.cpp) (for `llama-server`), the `claude` CLI and `curl`.
+
+Pick your platform: `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu` or `aarch64-unknown-linux-gnu`. The install line below uses Apple silicon. To build from source instead, use `cargo install --git https://github.com/dmytrosydor/Engram` (Rust 1.89+).
 
 ```sh
 brew install llama.cpp                 # Linux: a llama.cpp release or your package manager (CUDA or CPU build)
-cargo install --git https://github.com/dmytrosydor/Engram
-export PATH="$HOME/.cargo/bin:$PATH"   # add to your shell profile if cargo's bin is not on PATH yet
+mkdir -p ~/.local/bin && curl -L https://github.com/dmytrosydor/Engram/releases/latest/download/engram-aarch64-apple-darwin.tar.gz | tar xz -C ~/.local/bin engram
+export PATH="$HOME/.local/bin:$PATH"   # add to your shell profile if it is not on PATH yet
 
 engram model pull                      # 0.6 GB embedding model into ~/.engram/models, checksum verified
 engram spaces --init                   # drafts ~/.engram/spaces.toml from the folders Claude Code has worked in
@@ -43,11 +45,12 @@ Claude ──MCP──► search / get / write ──► ~/.engram/engram.db
                                           ▲
                      llama-server (bge-m3) ┘  on demand over a Unix socket, sleeps when idle
 
-hourly job ──► engram daily --if-due ──► claude -p (no tools) ──► review queue ──► you, in `engram`
+hourly job ──► engram daily --if-due ──► archive expired state, rebuild cores (no model)
 ```
 
 - **Records** are short, typed and dated: `rule`, `preference`, `decision`, `fact`, `gotcha`, `lesson`, `state`, `task`, `person`, `event`. Titles are ≤ 120 characters and bodies ≤ 1,500.
 - **`write` refuses near-duplicates** (cosine ≥ 0.88) and lists them. Claude then picks `add`, `update:<id>` or `supersede:<id>`.
+- **`write` flags what may be outdated.** A saved record comes back with up to three older ones on the same topic (cosine 0.58–0.88), so Claude can retire any that no longer hold with `supersede:<id>`. `global` records are only listed, since a session cannot change them.
 - **State expires.** `state` and `task` records can carry `valid_until`, and the daily pass archives them once it passes. Old state also ranks lower in search.
 - **The core is rebuilt** whenever a write touches it, and by the daily pass.
 
@@ -77,13 +80,13 @@ The code guarantees the following:
 - **Writes to `global`** are stored as unreviewed and reach other sessions' cores only after you accept them.
 - **Duplicate detection** works within one space. Writing text that happens to exist in another domain neither fails nor reveals that the other copy exists.
 - **Links** returned by `get` leave out records the session cannot see.
-- **The daily pass** never puts two domains' records in the same model request. Everything it proposes stays in the record's own domain or waits for your approval.
+- **`engram daily --with-claude`** never puts two domains' records in the same model request. Everything it proposes stays in the record's own domain or waits for your approval.
 
 What is **not** isolated:
 
 - **The terminal UI and the CLI** show every domain: they are you, not a session.
 - **The database file** is readable by your user account.
-- **The daily pass sends text to Claude.** It runs `claude -p`, which sends the transcript excerpts and records it is judging to Anthropic, the same way your normal Claude Code sessions do. Use `engram install --yes --no-daily` to skip it.
+- **`engram daily --with-claude` sends text to Claude.** It runs `claude -p`, which sends the transcript excerpts and records it is judging to Anthropic, the same way your normal Claude Code sessions do. The default daily pass sends nothing.
 
 ## Terminal UI
 
@@ -122,21 +125,21 @@ What is **not** isolated:
 
 - **Map:** `global` in the middle, a hub per domain, its spaces around it. Node size follows the number of records; lines between spaces are confirmed links. Arrows move between nodes, Enter opens a space.
 - **Space:** its records, newest first, with the full text. `p` pins, `a` archives or restores.
-- **Queue:** proposals headed for `global` first, since every session would see them. `y` accepts, `n` rejects.
+- **Queue:** usually empty. It holds writes headed for `global`, since every session would see them, plus whatever `engram daily --with-claude` proposes. `y` accepts, `n` rejects.
 - **Search:** searches as a session in the selected space would.
 
 ## Daily pass
 
-The scheduled job runs at most once a day, only on AC power. It:
+The scheduled job runs at most once a day and calls no model. It archives expired `state` and `task` records and rebuilds every core.
 
-1. archives expired `state` and `task` records;
-2. finds near-duplicate pairs within a domain and asks the model whether to merge them;
-3. classifies unreviewed (imported) records as keep or archive;
-4. reads Claude Code transcripts changed since the last run and proposes durable knowledge from them;
-5. turns notes from `engram add "…"` and files dropped in `~/.engram/inbox/` into proposals;
-6. rebuilds every core.
+`engram daily --with-claude` is optional and manual. It also:
 
-With the default limits a run makes up to about 15 `claude -p` calls on Sonnet. They count against your Claude Code plan, or are billed to your API key if you use one. Set `ENGRAM_DAILY_MODEL` to choose another model. Run it by hand with `engram daily`. The last run and its errors show in `engram doctor`.
+1. finds near-duplicate pairs within a domain and asks the model whether to merge them;
+2. classifies unreviewed (imported) records as keep or archive;
+3. reads Claude Code transcripts changed since the last run and proposes durable knowledge from them;
+4. turns notes from `engram add "…"` and files dropped in `~/.engram/inbox/` into proposals.
+
+Merges and new knowledge wait in the review queue. With the default limits a run makes up to about 15 `claude -p` calls on Sonnet. They count against your Claude Code plan, or are billed to your API key if you use one. Set `ENGRAM_DAILY_MODEL` to choose another model.
 
 ## Resources
 
@@ -154,7 +157,7 @@ With the default limits a run makes up to about 15 `claude -p` calls on Sonnet. 
 | `ENGRAM_HOME` | data folder (default `~/.engram`) |
 | `ENGRAM_LLAMA_SERVER` | path to `llama-server` (default: `PATH`, then `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, `~/.local/bin`) |
 | `ENGRAM_EMBED_SOCK` | Unix socket for llama-server (default `~/.engram/embed.sock`) |
-| `ENGRAM_DAILY_MODEL` | model for the daily pass (default `sonnet`) |
+| `ENGRAM_DAILY_MODEL` | model for `engram daily --with-claude` (default `sonnet`) |
 
 ## Importing
 
@@ -172,10 +175,10 @@ After an import, `engram reindex` computes the vectors. That takes about 5 minut
 | `engram core [dir]` / `--all` | the core a session there gets / sizes of all cores |
 | `engram search "q" [--dir d] [--scope project\|all\|archive]` | search as Claude would from a folder |
 | `engram get <id>…` | records in full |
-| `engram add "note"` | drop a note for the next daily pass |
+| `engram add "note"` | drop a note for the next `engram daily --with-claude` |
 | `engram review list \| accept <id> \| reject <id>` | the review queue |
 | `engram move --to <space> <id>…` | move records to another space |
-| `engram daily` | run the daily pass now |
+| `engram daily [--with-claude]` | run the daily pass now, optionally with the model |
 | `engram` | the terminal UI (also `engram tui`) |
 | `engram eval extract && engram eval run` | search quality on your own past sessions (Memora history) |
 | `engram uninstall --yes` | remove hook, MCP server and schedule; data stays |
@@ -194,7 +197,7 @@ rm -rf ~/.engram          # removes the data and the model, if you want that too
 - **No core at session start.** Run `echo '{"cwd":"'$PWD'"}' | engram hook session-start`. If it prints nothing, the folder's space has no records yet, or the folder has no rule (`engram where`).
 - **The MCP server is not connected.** Run `claude mcp get engram`. A local- or project-scope server with the same name overrides the user-scope one.
 - **Search says "words only".** The model or `llama-server` is missing; see `engram doctor`.
-- **`command not found: engram`.** Put `~/.cargo/bin` on your `PATH`.
+- **`command not found: engram`.** Put `~/.local/bin` (or `~/.cargo/bin` if you built from source) on your `PATH`.
 - **Wrong space.** Run `engram where`. Rules are folder prefixes after symlinks are resolved; reload `spaces.toml` after editing it.
 
 ## FAQ
