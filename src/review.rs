@@ -219,7 +219,24 @@ pub fn reject(conn: &Connection, id: i64) -> Result<()> {
     if e.status != "open" {
         bail!("review #{id} is already {}", e.status);
     }
-    decide(conn, id, "rejected")
+    decide(conn, id, "rejected")?;
+    // an archived record is still readable from every domain, so a global write nobody
+    // confirmed goes away entirely; the log keeps its text
+    if e.op == "activate"
+        && let Some(&item) = e.item_ids.first()
+    {
+        let before = store::item_json(conn, item)?;
+        if before["space_id"] == "global" && before["status"] == "proposed" {
+            conn.execute(
+                "UPDATE item SET superseded_by = NULL WHERE superseded_by = ?1",
+                [item],
+            )?;
+            conn.execute("DELETE FROM item_vec WHERE item_id = ?1", [item])?;
+            conn.execute("DELETE FROM item WHERE id = ?1", [item])?;
+            store::log(conn, "review", "reject", Some(item), Some(&before), None)?;
+        }
+    }
+    Ok(())
 }
 
 /// Closes an open review; fails if someone else decided it first.

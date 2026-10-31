@@ -78,7 +78,7 @@ The code guarantees the following:
 - **What a session sees.** A session in space `S` of domain `D` sees `S`, `D/_shared` and `global`. With `scope: "all"` it sees every space of `D` plus `global`. A session in `unsorted` sees only `unsorted` and `global`.
 - **`get`** opens what `search` can return: its own domain plus `global`. Anything else is "not found".
 - **`write`** refuses to target a space the session cannot see. `update` and `supersede` work only on records the session can see, and never on `global` records, which no session can change.
-- **Writes to `global`** are stored as unreviewed and reach other sessions' cores only after you accept them.
+- **Writes to `global`** stay hidden from every session, including in search and `get`, until you accept them. Rejecting one deletes the record; its text stays only in the local change log. Only you can confirm them: `engram daily --with-claude` leaves them alone.
 - **Duplicate detection** works within one space. Writing text that happens to exist in another domain neither fails nor reveals that the other copy exists.
 - **Links** returned by `get` leave out records the session cannot see.
 - **`engram daily --with-claude`** never puts two domains' records in the same model request. Everything it proposes stays in the record's own domain or waits for your approval.

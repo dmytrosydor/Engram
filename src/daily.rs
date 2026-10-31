@@ -347,7 +347,8 @@ fn expire(conn: &Connection) -> Result<usize> {
     let ids = ids(
         conn,
         "SELECT id FROM item WHERE kind IN ('state', 'task') AND status IN ('active', 'proposed')
-         AND valid_until IS NOT NULL AND valid_until < date('now')",
+         AND valid_until IS NOT NULL AND valid_until < date('now')
+         AND NOT (space_id = 'global' AND status = 'proposed')",
     )?;
     for &id in &ids {
         store::set_status(conn, id, "archived", None, ACTOR)?;
@@ -405,7 +406,8 @@ fn near_duplicates(conn: &Connection, since: Option<&str>) -> Result<Vec<(i64, i
 
 fn same_domain_live(conn: &Connection, (a, b): (i64, i64)) -> Result<bool> {
     Ok(conn.query_row(
-        "SELECT count(DISTINCT s.domain) = 1 AND sum(i.status IN ('active', 'proposed')) = 2
+        "SELECT count(DISTINCT s.domain) = 1 AND sum(i.status IN ('active', 'proposed')
+                AND NOT (i.space_id = 'global' AND i.status = 'proposed')) = 2
          FROM item i JOIN space s ON s.id = i.space_id WHERE i.id IN (?1, ?2)",
         params![a, b],
         |r| r.get(0),
@@ -466,12 +468,14 @@ fn judge_pairs(conn: &Connection, llm: &dyn Llm, pairs: &[(i64, i64, f32)]) -> R
     Ok(queued)
 }
 
-/// Oldest unreviewed items as (domain, id), grouped by domain.
+/// Oldest unreviewed items as (domain, id), grouped by domain. Global writes wait for
+/// the user: a model's "keep" must not put them in front of every session.
 fn proposed_items(conn: &Connection, limit: usize) -> Result<Vec<(String, i64)>> {
     let mut stmt = conn.prepare(
         "SELECT domain, id FROM (
              SELECT s.domain, i.id, i.created_at FROM item i JOIN space s ON s.id = i.space_id
-             WHERE i.status = 'proposed' ORDER BY i.created_at, i.id LIMIT ?1)
+             WHERE i.status = 'proposed' AND i.space_id <> 'global'
+             ORDER BY i.created_at, i.id LIMIT ?1)
          ORDER BY domain, created_at, id",
     )?;
     let ids = stmt

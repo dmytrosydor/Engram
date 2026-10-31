@@ -314,3 +314,63 @@ fn default_pass_archives_expired_state_and_runs_once_a_day_without_a_model() {
         .unwrap();
     assert_eq!(queue, 0, "the default pass queues nothing");
 }
+
+#[test]
+fn the_model_pass_never_confirms_or_expires_a_global_write() {
+    unsafe {
+        std::env::set_var("ENGRAM_EMBED_SOCK", "/nonexistent/engram-test.sock");
+        std::env::set_var("ENGRAM_LLAMA_SERVER", "/usr/bin/false");
+    }
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("engram.db");
+    db::init(&path).unwrap();
+    let conn = db::connect(&path).unwrap();
+    std::fs::write(dir.path().join("spaces.toml"), SPACES).unwrap();
+    spaces::load(&conn, &dir.path().join("spaces.toml")).unwrap();
+
+    let vis = spaces::visible(&conn, "work/acme").unwrap();
+    let global = |kind: &'static str, title: &'static str, until: Option<&'static str>| {
+        let w = Write {
+            kind,
+            title,
+            body: title,
+            space: "global",
+            source: None,
+            valid_until: until,
+            mode: Some("add"),
+            vector: None,
+            visible: &vis,
+            status: "proposed",
+        };
+        match memory::write(&conn, &w, "s").unwrap() {
+            Written::Created(id) => id,
+            other => panic!("{other:?}"),
+        }
+    };
+    let rule = global("rule", "Unconfirmed rule", None);
+    let old = global("state", "Unconfirmed old state", Some("2020-01-01"));
+
+    // the model would keep anything it is shown
+    let fake = Fake {
+        asked: RefCell::new(Vec::new()),
+        classify: format!(
+            r#"[{{"id": {rule}, "verdict": "keep", "kind": "rule", "scope": "global"}}]"#
+        ),
+    };
+    let opts = Options {
+        classify: 10,
+        transcripts: 0,
+        pairs: 0,
+        projects: dir.path().join("projects"),
+        inbox_dir: dir.path().join("inbox"),
+        exclude: vec![],
+    };
+    let r = daily::run(&conn, &fake, &opts, |_| {}).unwrap();
+    assert_eq!((r.classified, r.expired), (0, 0));
+    assert!(fake.asked.borrow().is_empty(), "their text never left");
+    assert_eq!(status(&conn, rule).0, "proposed");
+    assert_eq!(status(&conn, old).0, "proposed");
+
+    daily::tidy(&conn, |_| {}).unwrap();
+    assert_eq!(status(&conn, old).0, "proposed");
+}

@@ -217,7 +217,7 @@ impl Server {
                 "open",
             )?;
             msg.push_str(
-                " (global: waits for review in the engram queue before it reaches every session)",
+                " (global: hidden from every session until the user accepts it in the engram queue)",
             );
         }
         Ok(msg)

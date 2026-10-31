@@ -247,6 +247,8 @@ fn filter(q: &Query) -> (String, Vec<Value>) {
         args.push(Value::Null);
     }
     args.extend(q.spaces.iter().map(|s| Value::Text(s.clone())));
+    // every domain sees global, so a record nobody confirmed must not carry text across them
+    sql.push("NOT (i.space_id = 'global' AND i.status = 'proposed')".into());
     if let Some(kind) = q.kind {
         sql.push("i.kind = ?".into());
         args.push(Value::Text(kind.into()));
@@ -318,19 +320,19 @@ pub fn get(
 ) -> Result<String> {
     let mut out = Vec::new();
     for &id in ids {
-        let row: Option<(String, String)> = conn
+        let row: Option<(String, String, String)> = conn
             .query_row(
-                "SELECT space_id, '#' || id || ' ' || kind || ' ' || space_id || ' ' || status || ' '
+                "SELECT space_id, status, '#' || id || ' ' || kind || ' ' || space_id || ' ' || status || ' '
                         || substr(created_at, 1, 10)
                         || COALESCE(' until ' || valid_until, '') || COALESCE(' src ' || source, '')
                         || char(10) || title || char(10) || body
                  FROM item WHERE id = ?1",
                 [id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        let text = row
-            .and_then(|(space, text)| visible.is_none_or(|v| v.contains(&space)).then_some(text));
+        let text =
+            row.and_then(|(space, status, text)| sees(visible, &space, &status).then_some(text));
         let Some(mut text) = text else {
             out.push(format!("#{id} not found"));
             continue;
@@ -357,19 +359,26 @@ pub fn get(
 
 /// Confirmed links of an item, as `type #id` / `#id type this`. With `visible`,
 /// links to items outside those spaces are left out.
+/// Whether a session limited to `visible` may read a record; `None` is the user.
+fn sees(visible: Option<&[String]>, space: &str, status: &str) -> bool {
+    visible.is_none_or(|v| {
+        v.iter().any(|s| s == space) && !(space == "global" && status == "proposed")
+    })
+}
+
 pub fn links(conn: &Connection, id: i64, visible: Option<&[String]>) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(
-        "SELECT e.type, e.dst, 1, i.space_id FROM edge e JOIN item i ON i.id = e.dst
+        "SELECT e.type, e.dst, 1, i.space_id, i.status FROM edge e JOIN item i ON i.id = e.dst
          WHERE e.src = ?1 AND e.confirmed = 1
          UNION ALL
-         SELECT e.type, e.src, 0, i.space_id FROM edge e JOIN item i ON i.id = e.src
+         SELECT e.type, e.src, 0, i.space_id, i.status FROM edge e JOIN item i ON i.id = e.src
          WHERE e.dst = ?1 AND e.confirmed = 1",
     )?;
     let rows = stmt.query_map([id], |r| {
-        let (t, other, out, space): (String, i64, i64, String) =
-            (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?);
+        let (t, other, out, space, status): (String, i64, i64, String, String) =
+            (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?);
         Ok((
-            space,
+            sees(visible, &space, &status),
             if out == 1 {
                 format!("{t} #{other}")
             } else {
@@ -379,8 +388,8 @@ pub fn links(conn: &Connection, id: i64, visible: Option<&[String]>) -> Result<V
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (space, link) = row?;
-        if visible.is_none_or(|v| v.contains(&space)) {
+        let (seen, link) = row?;
+        if seen {
             out.push(link);
         }
     }

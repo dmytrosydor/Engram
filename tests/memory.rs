@@ -1,6 +1,7 @@
 use engram::memory::{self, Query, Scope, Write, Written};
-use engram::{db, spaces};
+use engram::{db, review, spaces};
 use rusqlite::Connection;
+use serde_json::json;
 use tempfile::TempDir;
 
 fn setup() -> (TempDir, Connection) {
@@ -766,4 +767,90 @@ fn update_to_text_another_record_holds_names_or_restores_it() {
         .unwrap(),
         Written::Updated(id) if id == live
     ));
+}
+
+#[test]
+fn unconfirmed_global_writes_stay_hidden_until_accepted_and_go_away_if_rejected() {
+    let (_d, conn) = setup();
+    let work = visible(&conn, "work/acme");
+    let personal = visible(&conn, "personal/side");
+    let vector = axis(7);
+    let write = |title: &'static str| {
+        let w = Write {
+            kind: "rule",
+            title,
+            body: title,
+            space: "global",
+            source: None,
+            valid_until: None,
+            mode: Some("add"),
+            vector: Some(&vector),
+            visible: &work,
+            status: "proposed",
+        };
+        let Written::Created(id) = memory::write(&conn, &w, "work-session").unwrap() else {
+            panic!()
+        };
+        let r = review::add(&conn, "activate", &[id], &json!({}), "global write", "open").unwrap();
+        (id, r)
+    };
+    let (id, r) = write("Zebra secret from a work session");
+    let linked = put(&conn, "personal/side", "fact", "Linked", "Linked", None);
+    conn.execute(
+        "INSERT INTO edge (src, dst, type, confirmed) VALUES (?1, ?2, 'about', 1)",
+        [linked, id],
+    )
+    .unwrap();
+
+    // no channel shows it: search, the archive, get, links, near-duplicate hints
+    for (spaces, scope) in [
+        (&personal, Scope::Project),
+        (&personal, Scope::Archive),
+        (&work, Scope::Project),
+    ] {
+        assert!(!search(&conn, "zebra", Some(axis(7)), spaces, scope).contains(&id));
+    }
+    let got = memory::get(&conn, &[id], "s", Some(&personal)).unwrap();
+    assert!(got.contains("not found") && !got.contains("Zebra"), "{got}");
+    let got = memory::get(&conn, &[linked], "s", Some(&personal)).unwrap();
+    assert!(!got.contains(&format!("#{id}")), "{got}");
+    assert!(
+        memory::similar(&conn, &axis(7), &personal)
+            .unwrap()
+            .is_empty()
+    );
+    // the user still sees it
+    assert!(
+        memory::get(&conn, &[id], "cli", None)
+            .unwrap()
+            .contains("Zebra")
+    );
+
+    // accepted: every session sees it
+    review::accept(&conn, r, None, "cli").unwrap();
+    assert!(search(&conn, "zebra", None, &personal, Scope::Project).contains(&id));
+
+    // rejected: gone from every scope, kept only in the log
+    let (id, r) = write("Quokka secret from a work session");
+    review::reject(&conn, r).unwrap();
+    let left: i64 = conn
+        .query_row("SELECT count(*) FROM item WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(left, 0);
+    assert!(!search(&conn, "quokka", None, &personal, Scope::Archive).contains(&id));
+    assert!(
+        memory::get(&conn, &[id], "cli", None)
+            .unwrap()
+            .contains("not found")
+    );
+    let logged: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM log WHERE item_id = ?1 AND op = 'reject'",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(logged, 1);
 }
