@@ -410,6 +410,8 @@ pub struct Write<'a> {
 pub enum Written {
     Created(i64),
     Exists(i64),
+    /// The same text was retired; the record is live again with this write's details.
+    Restored(i64),
     Updated(i64),
     Superseded {
         new: i64,
@@ -424,6 +426,7 @@ impl Written {
         match self {
             Written::Created(id) => format!("saved #{id}"),
             Written::Exists(id) => format!("already stored as #{id}"),
+            Written::Restored(id) => format!("restored #{id} from the archive"),
             Written::Updated(id) => format!("updated #{id}"),
             Written::Superseded { new, old } => format!("saved #{new}, #{old} marked superseded"),
             Written::Similar(similar) => {
@@ -484,8 +487,8 @@ pub fn write(conn: &Connection, w: &Write, actor: &str) -> Result<Written> {
             .optional()?;
         match target {
             // every session sees global items, so one session must not rewrite or retire them
-            Some((space, _)) if space == "global" && w.space != "global" => {
-                bail!("#{id} is in global; change it in the terminal UI")
+            Some((space, _)) if space == "global" => {
+                bail!("#{id} is in global: a session cannot change it, ask the user")
             }
             Some((space, status))
                 if w.visible.contains(&space) && (status == "active" || status == "proposed") => {}
@@ -544,18 +547,23 @@ pub fn write(conn: &Connection, w: &Write, actor: &str) -> Result<Written> {
             body: body.into(),
             status: w.status.into(),
             source: w.source.map(str::to_string),
-            valid_until,
+            valid_until: valid_until.clone(),
             ..NewItem::default()
         };
         match store::insert_item(&tx, &item, actor)? {
-            // the new text is already stored: the old record can still retire in its favour
-            Inserted::Duplicate(id) => match supersede.filter(|&old| old != id) {
-                Some(old) => {
-                    retire(&tx, old, id, actor)?;
-                    Written::Superseded { new: id, old }
+            // the new text is already stored: a retired copy comes back, so the write
+            // is never lost, and the old record can still retire in its favour
+            Inserted::Duplicate(id) => {
+                let restored = restore(&tx, id, w, title, valid_until.as_deref(), actor)?;
+                match supersede.filter(|&old| old != id) {
+                    Some(old) => {
+                        retire(&tx, old, id, actor)?;
+                        Written::Superseded { new: id, old }
+                    }
+                    None if restored => Written::Restored(id),
+                    None => Written::Exists(id),
                 }
-                None => Written::Exists(id),
-            },
+            }
             Inserted::New(id) => {
                 set_vector(&tx, id, w.vector)?;
                 match supersede {
@@ -570,6 +578,50 @@ pub fn write(conn: &Connection, w: &Write, actor: &str) -> Result<Written> {
     };
     tx.commit()?;
     Ok(result)
+}
+
+/// Makes a retired record live again with the details of `w`; false if it is live already.
+fn restore(
+    conn: &Connection,
+    id: i64,
+    w: &Write,
+    title: &str,
+    valid_until: Option<&str>,
+    actor: &str,
+) -> Result<bool> {
+    let before = store::item_json(conn, id)?;
+    if before["status"] == "active" || before["status"] == "proposed" {
+        return Ok(false);
+    }
+    conn.execute(
+        "UPDATE item SET status = ?2, kind = ?3, title = ?4, source = COALESCE(?5, source),
+                         valid_until = ?6, superseded_by = NULL, updated_at = ?7 WHERE id = ?1",
+        params![
+            id,
+            w.status,
+            w.kind,
+            title,
+            w.source,
+            valid_until,
+            store::now(conn)?
+        ],
+    )?;
+    conn.execute(
+        "DELETE FROM edge WHERE dst = ?1 AND type = 'supersedes'",
+        [id],
+    )?;
+    store::log(
+        conn,
+        actor,
+        "restore",
+        Some(id),
+        Some(&before),
+        Some(&store::item_json(conn, id)?),
+    )?;
+    if w.vector.is_some() {
+        set_vector(conn, id, w.vector)?;
+    }
+    Ok(true)
 }
 
 fn retire(conn: &Connection, old: i64, new: i64, actor: &str) -> Result<()> {

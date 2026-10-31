@@ -49,6 +49,7 @@ hourly job ──► engram daily --if-due ──► archive expired state, rebu
 ```
 
 - **Records** are short, typed and dated: `rule`, `preference`, `decision`, `fact`, `gotcha`, `lesson`, `state`, `task`, `person`, `event`. Titles are ≤ 120 characters and bodies ≤ 1,500.
+- **Writing retired text brings it back.** If the same text exists as an archived or superseded record, `write` restores that record instead of reporting it as stored.
 - **`write` refuses near-duplicates** (cosine ≥ 0.88) and lists them. Claude then picks `add`, `update:<id>` or `supersede:<id>`.
 - **`write` flags what may be outdated.** A saved record comes back with up to three older ones on the same topic (cosine 0.58–0.88), so Claude can retire any that no longer hold with `supersede:<id>`. `global` records are only listed, since a session cannot change them.
 - **State expires.** `state` and `task` records can carry `valid_until`, and the daily pass archives them once it passes. Old state also ranks lower in search.
@@ -75,8 +76,8 @@ Every domain automatically gets a `<domain>/_shared` space for knowledge its pro
 The code guarantees the following:
 
 - **What a session sees.** A session in space `S` of domain `D` sees `S`, `D/_shared` and `global`. With `scope: "all"` it sees every space of `D` plus `global`. A session in `unsorted` sees only `unsorted` and `global`.
-- **`get`** returns "not found" for records outside those spaces.
-- **`write`** refuses to target a space the session cannot see. `update` and `supersede` work only on records the session can see, and never on `global` records, which change only through the review queue.
+- **`get`** opens what `search` can return: its own domain plus `global`. Anything else is "not found".
+- **`write`** refuses to target a space the session cannot see. `update` and `supersede` work only on records the session can see, and never on `global` records, which no session can change.
 - **Writes to `global`** are stored as unreviewed and reach other sessions' cores only after you accept them.
 - **Duplicate detection** works within one space. Writing text that happens to exist in another domain neither fails nor reveals that the other copy exists.
 - **Links** returned by `get` leave out records the session cannot see.

@@ -99,7 +99,9 @@ impl Server {
         let me = self.clone();
         run(move || {
             let conn = db::connect(&me.db)?;
-            memory::get(&conn, &a.ids, &me.session, Some(&me.visible))
+            // anything `search` can return must open, so reads reach as far as scope=all
+            let readable = memory::spaces_for(&conn, &me.space, Scope::All)?;
+            memory::get(&conn, &a.ids, &me.session, Some(&readable))
         })
         .await
     }
@@ -199,8 +201,9 @@ impl Server {
             );
         }
         if space == "global"
-            && let memory::Written::Created(id) | memory::Written::Superseded { new: id, .. } =
-                written
+            && let memory::Written::Created(id)
+            | memory::Written::Restored(id)
+            | memory::Written::Superseded { new: id, .. } = written
         {
             crate::review::add(
                 &conn,

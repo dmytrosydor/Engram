@@ -421,7 +421,25 @@ fn sessions_cannot_touch_or_read_other_domains() {
             ..w
         };
         assert!(memory::write(&conn, &w, "t").is_err(), "{mode} on global");
+        // naming global as the target changes nothing
+        let w = Write {
+            space: "global",
+            visible: &visible(&conn, "personal/side"),
+            ..w
+        };
+        assert!(
+            memory::write(&conn, &w, "t").is_err(),
+            "{mode} with space=global"
+        );
     }
+    let (title, status): (String, String) = conn
+        .query_row(
+            "SELECT title, status FROM item WHERE id = ?1",
+            [shared],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((title.as_str(), status.as_str()), ("Be brief", "active"));
 }
 
 /// Unit vector with the given cosine to `axis(0)`.
@@ -523,4 +541,120 @@ fn supersede_retires_the_old_record_even_if_the_new_text_is_already_stored() {
         write("Laptop is a new MacBook", Some(&own)),
         Written::Exists(_)
     ));
+}
+
+#[test]
+fn everything_scope_all_finds_opens_within_the_domain_only() {
+    let (_d, conn) = setup();
+    conn.execute(
+        "INSERT INTO space (id, domain) VALUES ('work/other', 'work')",
+        [],
+    )
+    .unwrap();
+    let sibling = put(&conn, "work/other", "fact", "Sibling", "Sibling body", None);
+    let foreign = put(
+        &conn,
+        "personal/side",
+        "fact",
+        "Foreign",
+        "Foreign body",
+        None,
+    );
+
+    let readable = memory::spaces_for(&conn, "work/acme", Scope::All).unwrap();
+    let got = memory::get(&conn, &[sibling, foreign], "s", Some(&readable)).unwrap();
+    assert!(got.contains("Sibling body"), "{got}");
+    assert!(!got.contains("Foreign body"), "{got}");
+    assert!(got.contains(&format!("#{foreign} not found")), "{got}");
+}
+
+#[test]
+fn writing_retired_text_restores_the_record() {
+    let (_d, conn) = setup();
+    let vis = visible(&conn, "work/acme");
+    let base = Write {
+        kind: "fact",
+        title: "Stand IP",
+        body: "The stand is at 10.0.0.5",
+        space: "work/acme",
+        source: None,
+        valid_until: None,
+        mode: Some("add"),
+        vector: None,
+        visible: &vis,
+        status: "active",
+    };
+    let status = |id: i64| -> (String, Option<i64>) {
+        conn.query_row(
+            "SELECT status, superseded_by FROM item WHERE id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    };
+    let Written::Created(id) = memory::write(&conn, &base, "t").unwrap() else {
+        panic!()
+    };
+
+    // archived: comes back with the new title, and a live copy stays "already stored"
+    conn.execute("UPDATE item SET status = 'archived' WHERE id = ?1", [id])
+        .unwrap();
+    let renamed = Write {
+        title: "Stand address",
+        ..base
+    };
+    assert!(
+        matches!(memory::write(&conn, &renamed, "t").unwrap(), Written::Restored(r) if r == id)
+    );
+    assert_eq!(status(id), ("active".to_string(), None));
+    let title: String = conn
+        .query_row("SELECT title FROM item WHERE id = ?1", [id], |r| r.get(0))
+        .unwrap();
+    assert_eq!(title, "Stand address");
+    assert!(matches!(
+        memory::write(&conn, &base, "t").unwrap(),
+        Written::Exists(_)
+    ));
+
+    // superseded: the old link goes too
+    let newer = put(&conn, "work/acme", "fact", "Moved", "The stand moved", None);
+    let mode = format!("supersede:{id}");
+    let moved = Write {
+        title: "Moved",
+        body: "The stand moved",
+        mode: Some(&mode),
+        ..base
+    };
+    assert!(matches!(
+        memory::write(&conn, &moved, "t").unwrap(),
+        Written::Superseded { .. }
+    ));
+    assert_eq!(status(id), ("superseded".to_string(), Some(newer)));
+    assert!(matches!(memory::write(&conn, &base, "t").unwrap(), Written::Restored(r) if r == id));
+    assert_eq!(status(id), ("active".to_string(), None));
+    let edges: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM edge WHERE dst = ?1 AND type = 'supersedes'",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(edges, 0);
+
+    // superseding with text that is retired leaves one live record, not none
+    let old = put(&conn, "work/acme", "fact", "Old", "An old fact", None);
+    conn.execute("UPDATE item SET status = 'archived' WHERE id = ?1", [newer])
+        .unwrap();
+    let mode = format!("supersede:{old}");
+    let back = Write {
+        title: "Moved",
+        body: "The stand moved",
+        mode: Some(&mode),
+        ..base
+    };
+    assert!(
+        matches!(memory::write(&conn, &back, "t").unwrap(), Written::Superseded { new, .. } if new == newer)
+    );
+    assert_eq!(status(newer).0, "active");
+    assert_eq!(status(old).0, "superseded");
 }

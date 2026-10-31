@@ -170,7 +170,7 @@ fn apply(conn: &Connection, e: &Entry, edited: Option<NewProposal>, actor: &str)
                 },
                 actor,
             )?;
-            if let Written::Created(new) = written {
+            if let Written::Created(new) | Written::Restored(new) = written {
                 crate::core::rebuild(conn, &p.space)?;
                 conn.execute(
                     "UPDATE review SET item_ids = ?2 WHERE id = ?1",
