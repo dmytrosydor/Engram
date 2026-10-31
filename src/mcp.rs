@@ -179,10 +179,13 @@ impl Server {
             written,
             memory::Written::Similar(_) | memory::Written::Exists(_)
         ) {
-            // cores are cheap; global and _shared items, or an edit anywhere, touch many
+            // cores are cheap; global and _shared items, or a change to an old record, touch many
             if space == "global"
                 || space.ends_with("/_shared")
-                || matches!(written, memory::Written::Updated(_))
+                || matches!(
+                    written,
+                    memory::Written::Updated(_) | memory::Written::Superseded { .. }
+                )
             {
                 crate::core::rebuild_all(&conn)?;
             } else {

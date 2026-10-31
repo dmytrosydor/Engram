@@ -509,7 +509,44 @@ pub fn write(conn: &Connection, w: &Write, actor: &str) -> Result<Written> {
     let tx = conn.unchecked_transaction()?;
     let result = if let Some(id) = update {
         let before = store::item_json(&tx, id).context("no such item")?;
-        tx.execute(
+        let hash = store::content_hash(before["space_id"].as_str().unwrap_or_default(), body);
+        let holder: Option<(i64, String)> = tx
+            .query_row(
+                "SELECT id, status FROM item WHERE content_hash = ?1 AND id <> ?2",
+                params![hash, id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        match holder {
+            Some((other, status)) if status == "active" || status == "proposed" => {
+                bail!(
+                    "#{other} already holds this text; to retire #{id} in its favour, \
+                     repeat with mode=\"supersede:{id}\""
+                )
+            }
+            // a retired record holds the text: it comes back and takes over from the target
+            Some((other, _)) => {
+                let takes_over = Write {
+                    status: before["status"].as_str().unwrap_or("active"),
+                    ..*w
+                };
+                let valid_until = expiry(&tx, w)?;
+                restore(
+                    &tx,
+                    other,
+                    &takes_over,
+                    title,
+                    valid_until.as_deref(),
+                    actor,
+                )?;
+                retire(&tx, id, other, actor)?;
+                Written::Superseded {
+                    new: other,
+                    old: id,
+                }
+            }
+            None => {
+                tx.execute(
             "UPDATE item SET title = ?2, body = ?3, valid_until = COALESCE(?4, valid_until),
                              content_hash = ?5, updated_at = ?6 WHERE id = ?1",
             params![
@@ -517,29 +554,24 @@ pub fn write(conn: &Connection, w: &Write, actor: &str) -> Result<Written> {
                 title,
                 body,
                 w.valid_until,
-                store::content_hash(before["space_id"].as_str().unwrap_or_default(), body),
+                hash,
                 store::now(&tx)?
             ],
         )?;
-        store::log(
-            &tx,
-            actor,
-            "update",
-            Some(id),
-            Some(&before),
-            Some(&store::item_json(&tx, id)?),
-        )?;
-        set_vector(&tx, id, w.vector)?;
-        Written::Updated(id)
-    } else {
-        // state written without an end date still expires, so it cannot linger forever
-        let valid_until = match (w.valid_until, w.kind) {
-            (Some(d), _) => Some(d.to_string()),
-            (None, "state") => {
-                Some(tx.query_row("SELECT date('now', '+30 days')", [], |r| r.get(0))?)
+                store::log(
+                    &tx,
+                    actor,
+                    "update",
+                    Some(id),
+                    Some(&before),
+                    Some(&store::item_json(&tx, id)?),
+                )?;
+                set_vector(&tx, id, w.vector)?;
+                Written::Updated(id)
             }
-            (None, _) => None,
-        };
+        }
+    } else {
+        let valid_until = expiry(&tx, w)?;
         let item = NewItem {
             space_id: w.space.into(),
             kind: w.kind.into(),
@@ -578,6 +610,18 @@ pub fn write(conn: &Connection, w: &Write, actor: &str) -> Result<Written> {
     };
     tx.commit()?;
     Ok(result)
+}
+
+/// The end date of a new or restored record. State written without one still
+/// expires, so it cannot linger forever.
+fn expiry(conn: &Connection, w: &Write) -> Result<Option<String>> {
+    Ok(match (w.valid_until, w.kind) {
+        (Some(d), _) => Some(d.to_string()),
+        (None, "state") => {
+            Some(conn.query_row("SELECT date('now', '+30 days')", [], |r| r.get(0))?)
+        }
+        (None, _) => None,
+    })
 }
 
 /// Makes a retired record live again with the details of `w`; false if it is live already.

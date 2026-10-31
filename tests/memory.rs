@@ -658,3 +658,112 @@ fn writing_retired_text_restores_the_record() {
     assert_eq!(status(newer).0, "active");
     assert_eq!(status(old).0, "superseded");
 }
+
+#[test]
+fn update_to_text_another_record_holds_names_or_restores_it() {
+    let (_d, conn) = setup();
+    let vis = visible(&conn, "work/acme");
+    let target = put(&conn, "work/acme", "fact", "Target", "Target text", None);
+    let live = put(&conn, "work/acme", "fact", "Live", "Live text", None);
+    let gone = put(&conn, "work/acme", "fact", "Gone", "Retired text", None);
+    conn.execute("UPDATE item SET status = 'archived' WHERE id = ?1", [gone])
+        .unwrap();
+    let mode = format!("update:{target}");
+    let base = Write {
+        kind: "gotcha",
+        title: "New title",
+        body: "",
+        space: "work/acme",
+        source: None,
+        valid_until: None,
+        mode: Some(&mode),
+        vector: None,
+        visible: &vis,
+        status: "active",
+    };
+    let row = |id: i64| -> (String, String, Option<i64>) {
+        conn.query_row(
+            "SELECT status, title, superseded_by FROM item WHERE id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+    };
+
+    // a live holder is named, with the way out, and nothing changes
+    let err = memory::write(
+        &conn,
+        &Write {
+            body: "Live text",
+            ..base
+        },
+        "t",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains(&format!("#{live}")), "{err}");
+    assert!(err.contains(&format!("supersede:{target}")), "{err}");
+    assert!(!err.contains("UNIQUE"), "{err}");
+    assert_eq!(row(target).0, "active");
+
+    // the way out the error names works
+    let probe = put(&conn, "work/acme", "fact", "Probe", "Probe text", None);
+    let probe_mode = format!("update:{probe}");
+    assert!(
+        memory::write(
+            &conn,
+            &Write {
+                body: "Live text",
+                mode: Some(&probe_mode),
+                ..base
+            },
+            "t",
+        )
+        .is_err()
+    );
+    let probe_out = format!("supersede:{probe}");
+    assert!(matches!(
+        memory::write(
+            &conn,
+            &Write {
+                body: "Live text",
+                mode: Some(&probe_out),
+                ..base
+            },
+            "t",
+        )
+        .unwrap(),
+        Written::Superseded { new, old } if new == live && old == probe
+    ));
+
+    // a retired holder comes back with this write's details and replaces the target
+    let written = memory::write(
+        &conn,
+        &Write {
+            body: "Retired text",
+            ..base
+        },
+        "t",
+    )
+    .unwrap();
+    assert!(matches!(written, Written::Superseded { new, old } if new == gone && old == target));
+    assert_eq!(row(gone), ("active".into(), "New title".into(), None));
+    assert_eq!(row(target).0, "superseded");
+    assert_eq!(row(target).2, Some(gone));
+
+    // updating a record to its own text still works
+    let own = format!("update:{live}");
+    assert!(matches!(
+        memory::write(
+            &conn,
+            &Write {
+                body: "Live text",
+                mode: Some(&own),
+                ..base
+            },
+            "t",
+        )
+        .unwrap(),
+        Written::Updated(id) if id == live
+    ));
+}
