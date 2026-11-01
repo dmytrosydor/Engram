@@ -18,8 +18,15 @@ use crate::memory::{self, Query, Scope, Write};
 use crate::{db, embed, index, spaces};
 
 const INSTRUCTIONS: &str = "Long-term memory across sessions. \
-search before answering about past work, decisions or conventions; get for full text; \
-write one durable fact per call (decision, gotcha, rule, preference), not progress notes.";
+search before answering about past work, decisions or conventions; get for full text. \
+Keep: decisions with their reason, gotchas and pitfalls met, rules and preferences the user \
+stated, facts about the environment that the code does not show. \
+Skip: progress, checkpoints, plans, lists of commits or PRs, anything readable from the code \
+or git history. Where the work stands belongs in one `state` record per topic with a \
+valid_until date, updated in place, never a new record per hour. \
+Before a write, search the topic: if a record covers it, use update:<id> for a small change \
+or supersede:<id> when the fact changed, instead of adding a second record. \
+One fact per record, body at most a few sentences.";
 
 #[derive(Clone)]
 pub struct Server {
@@ -50,15 +57,18 @@ pub struct GetArgs {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct WriteArgs {
-    /// rule, preference, decision, fact, gotcha, lesson, state, task, person, event.
+    /// rule (must or must not), preference (how the user likes things), decision (what was
+    /// chosen and why), fact (true about the project or environment), gotcha (a trap met),
+    /// lesson (what an outcome taught), state (where a topic stands now; expires), task (to do;
+    /// expires), person (who someone is), event (something that happened on a date).
     pub kind: String,
     /// The gist, at most 120 characters.
     pub title: String,
-    /// One fact with its evidence, at most 1500 characters.
+    /// The fact and why it holds, a few sentences; at most 1500 characters.
     pub body: String,
     /// Where it came from, e.g. "pr:owner/repo#12" or "session".
     pub source: Option<String>,
-    /// For state and task: YYYY-MM-DD after which it is archived.
+    /// For state and task: YYYY-MM-DD after which it is archived (state defaults to 30 days).
     pub valid_until: Option<String>,
     /// Omit first; if similar items exist, repeat with "add", "update:<id>" or "supersede:<id>".
     pub mode: Option<String>,
@@ -106,7 +116,11 @@ impl Server {
         .await
     }
 
-    #[tool(description = "Save one durable fact. Refuses near-duplicates until you pick a mode")]
+    #[tool(
+        description = "Save one durable fact: a decision, gotcha, rule, preference or fact worth \
+                       knowing in a later session; not a status update. Refuses near-duplicates \
+                       until you pick a mode"
+    )]
     async fn write(
         &self,
         Parameters(a): Parameters<WriteArgs>,
