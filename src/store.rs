@@ -33,6 +33,8 @@ pub struct NewItem {
     pub updated_at: Option<String>,
     pub valid_until: Option<String>,
     pub legacy_id: Option<String>,
+    /// Hash the body under this scope instead of `space_id` (see [`proposal_scope`]).
+    pub hash_scope: Option<String>,
 }
 
 pub enum Inserted {
@@ -84,8 +86,22 @@ pub fn clip(s: &str, max: usize) -> String {
     }
 }
 
+/// Hash scope of a global record a session proposed and the user has not accepted yet.
+///
+/// Every session can write to `global`, so if hidden proposals shared global's hash
+/// scope, a session writing the same text would collide with another domain's hidden
+/// proposal and learn that it exists (and its id). Until it is accepted, a proposal
+/// only collides with proposals from its own domain; accepting it rehashes it under
+/// `global` ([`activate_global`]).
+pub fn proposal_scope(domain: &str) -> String {
+    format!("global@{domain}")
+}
+
 pub fn insert_item(conn: &Connection, item: &NewItem, actor: &str) -> Result<Inserted> {
-    let hash = content_hash(&item.space_id, &item.body);
+    let hash = content_hash(
+        item.hash_scope.as_deref().unwrap_or(&item.space_id),
+        &item.body,
+    );
     let existing: Option<i64> = conn
         .query_row(
             "SELECT id FROM item WHERE content_hash = ?1",
@@ -214,6 +230,57 @@ pub fn set_status(
         Some(&before),
         Some(&after),
     )
+}
+
+/// Makes a proposed record live under its space's normal hash scope. If the space
+/// already holds the same text, that record stays (restored if it was retired) and the
+/// proposal is deleted, since the unique hash cannot hold both. Returns the live id.
+pub fn activate(conn: &Connection, id: i64, actor: &str) -> Result<i64> {
+    let before = item_json(conn, id)?;
+    let space = before["space_id"].as_str().context("item without space")?;
+    let body = before["body"].as_str().context("item without body")?;
+    let hash = content_hash(space, body);
+    let holder: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT id, status FROM item WHERE content_hash = ?1 AND id <> ?2",
+            params![hash, id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((other, status)) = holder else {
+        conn.execute(
+            "UPDATE item SET content_hash = ?2 WHERE id = ?1",
+            params![id, hash],
+        )?;
+        set_status(conn, id, "active", None, actor)?;
+        return Ok(id);
+    };
+    conn.execute(
+        "UPDATE item SET superseded_by = ?2 WHERE superseded_by = ?1",
+        params![id, other],
+    )?;
+    conn.execute("DELETE FROM item_vec WHERE item_id = ?1", [id])?;
+    conn.execute("DELETE FROM item WHERE id = ?1", [id])?;
+    log(
+        conn,
+        actor,
+        "activate:existing",
+        Some(id),
+        Some(&before),
+        None,
+    )?;
+    if status != "active" {
+        conn.execute(
+            "UPDATE item SET superseded_by = NULL WHERE id = ?1",
+            [other],
+        )?;
+        conn.execute(
+            "DELETE FROM edge WHERE dst = ?1 AND type = 'supersedes'",
+            [other],
+        )?;
+        set_status(conn, other, "active", None, actor)?;
+    }
+    Ok(other)
 }
 
 pub fn set_pinned(conn: &Connection, id: i64, pinned: bool, actor: &str) -> Result<()> {

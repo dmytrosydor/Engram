@@ -41,7 +41,7 @@ pub fn embed_missing(
         for batch in rows.chunks(BATCH) {
             let texts: Vec<&str> = batch.iter().map(|(_, t)| t.as_str()).collect();
             let vectors = embed::embed(&texts)?;
-            let tx = conn.unchecked_transaction()?;
+            let tx = crate::db::write_tx(conn)?;
             for ((id, _), v) in batch.iter().zip(vectors) {
                 tx.execute(
                     &format!("INSERT INTO {table} ({key}, emb) VALUES (?1, ?2)"),

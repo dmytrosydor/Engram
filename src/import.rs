@@ -78,7 +78,7 @@ pub fn memora(
     let mut ids: HashMap<i64, i64> = HashMap::new(); // memora id -> item id
     let mut documents: BTreeMap<String, Vec<&Memory>> = BTreeMap::new();
 
-    let tx = conn.unchecked_transaction()?;
+    let tx = crate::db::write_tx(conn)?;
     for m in &memories {
         let Some(row) = plan.get(&m.id) else {
             report.unmapped += 1;
@@ -364,7 +364,7 @@ pub fn auto_memory_scan(conn: &Connection, projects: &Path) -> Result<Report> {
         .collect::<rusqlite::Result<_>>()?;
     let encode = |p: &str| p.replace(['/', '.'], "-");
     let mut report = Report::default();
-    let tx = conn.unchecked_transaction()?;
+    let tx = crate::db::write_tx(conn)?;
     let mut dirs: Vec<_> = std::fs::read_dir(projects)
         .with_context(|| format!("read {}", projects.display()))?
         .flatten()
@@ -449,7 +449,7 @@ pub fn auto_memory(conn: &Connection, projects: &Path, inventory: &Path) -> Resu
     let rows = read_csv::<AutoRow>(inventory)?;
     let mapper = Mapper::new(conn)?;
     let mut report = Report::default();
-    let tx = conn.unchecked_transaction()?;
+    let tx = crate::db::write_tx(conn)?;
     for row in &rows {
         if row.action.starts_with("drop") || row.file == "MEMORY.md" {
             report.dropped += 1;

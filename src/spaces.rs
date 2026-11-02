@@ -64,9 +64,28 @@ pub fn ensure_builtin(conn: &Connection) -> Result<()> {
 pub fn load(conn: &Connection, file: &Path) -> Result<(usize, usize)> {
     let text = std::fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
     let cfg: Config = toml::from_str(&text).with_context(|| format!("parse {}", file.display()))?;
-    let tx = conn.unchecked_transaction()?;
+    let tx = crate::db::write_tx(conn)?;
     ensure_builtin(&tx)?;
     for (id, def) in &cfg.spaces {
+        // a built-in space keeps its domain: moved into one, every unmapped folder
+        // (unsorted) or every session (global) would see that domain's records
+        if let Some((_, own)) = BUILTIN.iter().find(|(b, _)| b == id)
+            && def.domain != *own
+        {
+            bail!(
+                "space {id} is built in; it cannot join domain {}",
+                def.domain
+            );
+        }
+        // `<d>/_shared` is what domain d's sessions see, so it must belong to d
+        if let Some(owner) = id.strip_suffix("/_shared")
+            && owner != def.domain
+        {
+            bail!(
+                "space {id} is domain {owner}'s shared space; it cannot join domain {}",
+                def.domain
+            );
+        }
         if def.domain == "global" || def.domain == INBOX {
             // the built-in spaces may be listed; nothing else may join their domains
             if *id == def.domain {

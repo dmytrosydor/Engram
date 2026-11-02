@@ -485,24 +485,19 @@ pub fn write(conn: &Connection, w: &Write, actor: &str) -> Result<Written> {
     if w.mode.is_some_and(|m| m != "add") && update.is_none() && supersede.is_none() {
         bail!("mode must be add, update:<id> or supersede:<id>");
     }
-    // a session may only change live items it can see
-    for id in update.iter().chain(supersede.iter()) {
-        let target: Option<(String, String)> = conn
-            .query_row(
-                "SELECT space_id, status FROM item WHERE id = ?1",
-                [id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        match target {
-            // every session sees global items, so one session must not rewrite or retire them
-            Some((space, _)) if space == "global" => {
-                bail!("#{id} is in global: a session cannot change it, ask the user")
-            }
-            Some((space, status))
-                if w.visible.contains(&space) && (status == "active" || status == "proposed") => {}
-            Some((_, status)) if w.visible.is_empty() => bail!("#{id} is {status}"),
-            _ => bail!("#{id} is not a live item visible from this session"),
+    // a global write from a session stays hidden until the user accepts it
+    let hidden_global = w.space == "global" && w.status == "proposed";
+    if hidden_global && supersede.is_some() {
+        bail!(
+            "supersede:<id> cannot go with space=\"global\": the global record waits for the \
+             user, so the old one would be retired for nothing; save it without a mode and \
+             tell the user which record it replaces"
+        );
+    }
+    if let Some(d) = w.valid_until {
+        let valid: bool = conn.query_row("SELECT date(?1) IS ?1", [d], |r| r.get(0))?;
+        if !valid {
+            bail!("valid_until must be a date as YYYY-MM-DD, got {d:?}");
         }
     }
 
@@ -515,7 +510,34 @@ pub fn write(conn: &Connection, w: &Write, actor: &str) -> Result<Written> {
         }
     }
 
-    let tx = conn.unchecked_transaction()?;
+    // BEGIN IMMEDIATE, and the checks inside it, so no other session changes the
+    // targets between the check and the write
+    let tx = crate::db::write_tx(conn)?;
+    // a session may only change live items it can see
+    for id in update.iter().chain(supersede.iter()) {
+        let target: Option<(String, String)> = tx
+            .query_row(
+                "SELECT space_id, status FROM item WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        match target {
+            // a hidden global proposal answers like a missing id, so its existence stays hidden
+            Some((space, status)) if space == "global" && status == "proposed" => {
+                bail!("#{id} is not a live item visible from this session")
+            }
+            // every session sees global items, so one session must not rewrite or retire them
+            Some((space, _)) if space == "global" => {
+                bail!("#{id} is in global: a session cannot change it, ask the user")
+            }
+            Some((space, status))
+                if w.visible.contains(&space) && (status == "active" || status == "proposed") => {}
+            Some((_, status)) if w.visible.is_empty() => bail!("#{id} is {status}"),
+            _ => bail!("#{id} is not a live item visible from this session"),
+        }
+    }
+
     let result = if let Some(id) = update {
         let before = store::item_json(&tx, id).context("no such item")?;
         let hash = store::content_hash(before["space_id"].as_str().unwrap_or_default(), body);
@@ -589,6 +611,12 @@ pub fn write(conn: &Connection, w: &Write, actor: &str) -> Result<Written> {
             status: w.status.into(),
             source: w.source.map(str::to_string),
             valid_until: valid_until.clone(),
+            hash_scope: match w.visible.first() {
+                Some(own) if hidden_global => {
+                    Some(store::proposal_scope(&spaces::domain(&tx, own)?))
+                }
+                _ => None,
+            },
             ..NewItem::default()
         };
         match store::insert_item(&tx, &item, actor)? {
