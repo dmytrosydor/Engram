@@ -43,6 +43,19 @@ fn register_vec() {
     });
 }
 
+/// A transaction that takes the write lock up front (`BEGIN IMMEDIATE`).
+///
+/// A deferred transaction that reads and then writes cannot wait for the lock: under
+/// WAL, if another connection commits in between, SQLite fails the write at once with
+/// SQLITE_BUSY and never calls the busy handler. Several MCP sessions (and parallel
+/// tool calls within one) write at the same time, so every read-then-write goes here.
+pub fn write_tx(conn: &Connection) -> Result<rusqlite::Transaction<'_>> {
+    Ok(rusqlite::Transaction::new_unchecked(
+        conn,
+        rusqlite::TransactionBehavior::Immediate,
+    )?)
+}
+
 pub fn connect(path: &Path) -> Result<Connection> {
     register_vec();
     let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
@@ -88,7 +101,7 @@ pub fn init(path: &Path) -> Result<()> {
             )?;
             conn.pragma_update(None, "foreign_keys", true)?;
         }
-        let tx = conn.unchecked_transaction()?;
+        let tx = write_tx(&conn)?;
         let rows: Vec<(i64, String, String)> = tx
             .prepare("SELECT id, space_id, body FROM item")?
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?

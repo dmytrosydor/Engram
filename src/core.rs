@@ -24,9 +24,11 @@ const SECTIONS: [Section; 4] = [
     Section {
         title: "rules & preferences",
         // the project's own rules first, global ones fill the rest
-        // unreviewed rules count only in their own project
+        // unreviewed rules count only in their own project; unconfirmed global ones in none,
+        // since they may come from another domain
         sql: "SELECT * FROM v WHERE kind IN ('rule', 'preference')
-              AND (status = 'active' OR (status = 'proposed' AND space_id = :space))
+              AND (status = 'active' OR (status = 'proposed' AND space_id = :space
+                                                    AND space_id <> 'global'))
               ORDER BY pinned DESC, space_id = :space DESC, status = 'active' DESC, hits DESC,
                        COALESCE(updated_at, created_at) DESC",
         limit: 15,

@@ -217,8 +217,8 @@ pub fn run(
     let pairs = near_duplicates(conn, meta(conn, "dup_since")?.as_deref())?;
     r.pairs_found = pairs.len();
     let mut judged = 0;
-    for batch in pairs
-        .chunks(PAIR_BATCH)
+    for batch in pair_batches(conn, &pairs)?
+        .iter()
         .take(opts.pairs.div_ceil(PAIR_BATCH))
     {
         match judge_pairs(conn, llm, batch) {
@@ -412,6 +412,32 @@ fn same_domain_live(conn: &Connection, (a, b): (i64, i64)) -> Result<bool> {
         params![a, b],
         |r| r.get(0),
     )?)
+}
+
+/// Pairs batched for the model: one prompt never carries two domains' records (each
+/// pair is within one domain, but a batch of pairs need not be). Batches are ordered by
+/// their closest pair, so the most likely duplicates are judged first.
+fn pair_batches(conn: &Connection, pairs: &[(i64, i64, f32)]) -> Result<Vec<Vec<(i64, i64, f32)>>> {
+    let mut by_domain: Vec<(String, (i64, i64, f32))> = pairs
+        .iter()
+        .map(|&p| {
+            let domain: String = conn.query_row(
+                "SELECT s.domain FROM item i JOIN space s ON s.id = i.space_id WHERE i.id = ?1",
+                [p.0],
+                |r| r.get(0),
+            )?;
+            Ok((domain, p))
+        })
+        .collect::<Result<_>>()?;
+    // stable: within a domain the pairs keep their closest-first order
+    by_domain.sort_by(|x, y| x.0.cmp(&y.0));
+    let mut batches: Vec<Vec<(i64, i64, f32)>> = by_domain
+        .chunk_by(|x, y| x.0 == y.0)
+        .flat_map(|run| run.chunks(PAIR_BATCH))
+        .map(|chunk| chunk.iter().map(|(_, p)| *p).collect())
+        .collect();
+    batches.sort_by(|x, y| y[0].2.total_cmp(&x[0].2));
+    Ok(batches)
 }
 
 #[derive(Deserialize)]

@@ -205,9 +205,15 @@ fn apply(conn: &Connection, e: &Entry, edited: Option<NewProposal>, actor: &str)
         }
         "activate" => {
             let id = *e.item_ids.first().context("activate without item")?;
-            store::set_status(conn, id, "active", None, actor)?;
+            let tx = crate::db::write_tx(conn)?;
+            let live = store::activate(&tx, id, actor)?;
+            tx.commit()?;
             crate::core::rebuild_all(conn)?;
-            format!("#{id} is active")
+            if live == id {
+                format!("#{id} is active")
+            } else {
+                format!("#{live} already held this text and is active; #{id} was folded into it")
+            }
         }
         other => bail!("unknown review op {other}"),
     };
