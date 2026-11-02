@@ -52,10 +52,43 @@ pub fn scheduled() -> bool {
     }
 }
 
-/// The binary as invoked; not canonicalised, so a stable symlink (e.g. in
-/// ~/.cargo/bin or /opt/homebrew/bin) survives upgrades.
+/// The binary as invoked, so a stable symlink (e.g. ~/.local/bin/engram, or Homebrew's
+/// bin link to a versioned Cellar folder) survives upgrades.
+///
+/// `current_exe` alone is not enough: on Linux it reads /proc/self/exe, which has every
+/// symlink resolved, so the hook, MCP server and timer would point at the versioned
+/// target and break on the next upgrade. argv[0] (looked up on PATH when bare) is used
+/// instead whenever it is the same file.
 fn exe() -> Result<PathBuf> {
-    Ok(std::env::current_exe()?)
+    let real = std::env::current_exe()?;
+    let invoked = std::env::args_os().next().and_then(|arg0| {
+        invoked_path(
+            Path::new(&arg0),
+            std::env::var_os("PATH").as_deref(),
+            &std::env::current_dir().ok()?,
+        )
+    });
+    Ok(invoked.filter(|p| same_file(p, &real)).unwrap_or(real))
+}
+
+/// Absolute path of the program named by argv[0]: relative to `cwd` when it has a
+/// folder part, else the first match on `path_env` (as the shell found it).
+fn invoked_path(arg0: &Path, path_env: Option<&std::ffi::OsStr>, cwd: &Path) -> Option<PathBuf> {
+    if arg0.as_os_str().is_empty() {
+        return None;
+    }
+    let found = if arg0.components().count() > 1 {
+        arg0.to_path_buf()
+    } else {
+        std::env::split_paths(path_env?)
+            .map(|dir| dir.join(arg0))
+            .find(|p| p.is_file())?
+    };
+    std::path::absolute(cwd.join(found)).ok()
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    matches!((a.canonicalize(), b.canonicalize()), (Ok(x), Ok(y)) if x == y)
 }
 
 /// Single-quoted for the shell Claude Code runs hook commands in.
@@ -217,15 +250,27 @@ fn systemd_units(exe: &Path, path_env: &str) -> (String, String) {
     let log = db::home().join("daily.log");
     let service = format!(
         "[Unit]\nDescription=engram daily pass\n\n[Service]\nType=oneshot\n\
-         Environment=PATH={path_env}\nExecStart={exe} daily --if-due\n\
+         Environment={env}\nExecStart={exe} daily --if-due\n\
          StandardOutput=append:{log}\nStandardError=append:{log}\nNice=10\nIOSchedulingClass=idle\n",
-        exe = exe.display(),
-        log = log.display()
+        env = systemd_quote(&format!("PATH={path_env}")),
+        exe = systemd_quote(&exe.to_string_lossy()),
+        log = log.to_string_lossy().replace('%', "%%")
     );
     let timer = "[Unit]\nDescription=engram daily pass, checked hourly\n\n\
                  [Timer]\nOnCalendar=hourly\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n"
         .to_string();
     (service, timer)
+}
+
+/// One word in a unit file: double-quoted so spaces survive, `%` doubled so systemd
+/// does not read it as a specifier.
+fn systemd_quote(s: &str) -> String {
+    format!(
+        "\"{}\"",
+        s.replace('\\', r"\\")
+            .replace('"', "\\\"")
+            .replace('%', "%%")
+    )
 }
 
 pub fn uninstall(apply: bool) -> Result<()> {
@@ -450,9 +495,36 @@ mod tests {
     #[test]
     fn systemd_units_run_the_daily_pass_hourly() {
         let (service, timer) = systemd_units(Path::new("/opt/engram"), "/usr/bin:/bin");
-        assert!(service.contains("ExecStart=/opt/engram daily --if-due"));
-        assert!(service.contains("Environment=PATH=/usr/bin:/bin"));
+        assert!(service.contains("ExecStart=\"/opt/engram\" daily --if-due"));
+        assert!(service.contains("Environment=\"PATH=/usr/bin:/bin\""));
         assert!(timer.contains("OnCalendar=hourly") && timer.contains("Persistent=true"));
+        // a space or a % in the path must not split the command or become a specifier
+        let (service, _) = systemd_units(Path::new("/home/a b/50%/engram"), "/usr/bin");
+        assert!(service.contains(r#"ExecStart="/home/a b/50%%/engram" daily --if-due"#));
+    }
+
+    #[test]
+    fn invoked_path_keeps_the_symlink_the_user_ran() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("Cellar/engram/0.1.2/engram");
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        std::fs::write(&real, "").unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::os::unix::fs::symlink(&real, bin.join("engram")).unwrap();
+
+        // bare name: found on PATH, as the shell did
+        let path_env = std::env::join_paths([dir.path().join("nothing"), bin.clone()]).unwrap();
+        let found = invoked_path(Path::new("engram"), Some(&path_env), dir.path()).unwrap();
+        assert_eq!(found, bin.join("engram"));
+        assert!(same_file(&found, &real));
+        // relative with a folder part: against the working folder
+        assert_eq!(
+            invoked_path(Path::new("./bin/engram"), None, dir.path()).unwrap(),
+            bin.join("engram")
+        );
+        assert!(invoked_path(Path::new("engram"), None, dir.path()).is_none());
+        assert!(!same_file(&bin.join("engram"), &dir.path().join("other")));
     }
 
     #[test]
