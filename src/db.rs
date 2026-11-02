@@ -65,7 +65,7 @@ pub fn connect(path: &Path) -> Result<Connection> {
 }
 
 /// Current schema version, stored in `PRAGMA user_version`.
-pub const VERSION: i64 = 2;
+pub const VERSION: i64 = 3;
 
 /// Creates the database or brings it up to the current schema.
 pub fn init(path: &Path) -> Result<()> {
@@ -110,6 +110,25 @@ pub fn init(path: &Path) -> Result<()> {
             tx.execute(
                 "UPDATE item SET content_hash = ?2 WHERE id = ?1",
                 rusqlite::params![id, crate::store::content_hash(&space, &body)],
+            )?;
+        }
+        tx.commit()?;
+    }
+    if version < 3 {
+        // v3: hidden global proposals no longer share global's hash scope (see
+        // store::proposal_scope); older ones get a scope of their own
+        let tx = write_tx(&conn)?;
+        let rows: Vec<(i64, String)> = tx
+            .prepare("SELECT id, body FROM item WHERE space_id = 'global' AND status = 'proposed'")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (id, body) in rows {
+            tx.execute(
+                "UPDATE item SET content_hash = ?2 WHERE id = ?1",
+                rusqlite::params![
+                    id,
+                    crate::store::content_hash(&crate::store::legacy_proposal_scope(id), &body)
+                ],
             )?;
         }
         tx.commit()?;

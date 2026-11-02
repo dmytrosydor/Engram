@@ -253,7 +253,9 @@ fn systemd_units(exe: &Path, path_env: &str) -> (String, String) {
          Environment={env}\nExecStart={exe} daily --if-due\n\
          StandardOutput=append:{log}\nStandardError=append:{log}\nNice=10\nIOSchedulingClass=idle\n",
         env = systemd_quote(&format!("PATH={path_env}")),
-        exe = systemd_quote(&exe.to_string_lossy()),
+        // ExecStart expands $VAR; Environment= does not
+        exe = systemd_quote(&exe.to_string_lossy()).replace('$', "$$"),
+        // the rest of the line is the path, spaces included; quotes would become part of it
         log = log.to_string_lossy().replace('%', "%%")
     );
     let timer = "[Unit]\nDescription=engram daily pass, checked hourly\n\n\
@@ -499,8 +501,8 @@ mod tests {
         assert!(service.contains("Environment=\"PATH=/usr/bin:/bin\""));
         assert!(timer.contains("OnCalendar=hourly") && timer.contains("Persistent=true"));
         // a space or a % in the path must not split the command or become a specifier
-        let (service, _) = systemd_units(Path::new("/home/a b/50%/engram"), "/usr/bin");
-        assert!(service.contains(r#"ExecStart="/home/a b/50%%/engram" daily --if-due"#));
+        let (service, _) = systemd_units(Path::new("/home/a b/50%/$x/engram"), "/usr/bin");
+        assert!(service.contains(r#"ExecStart="/home/a b/50%%/$$x/engram" daily --if-due"#));
     }
 
     #[test]

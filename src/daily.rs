@@ -217,10 +217,14 @@ pub fn run(
     let pairs = near_duplicates(conn, meta(conn, "dup_since")?.as_deref())?;
     r.pairs_found = pairs.len();
     let mut judged = 0;
-    for batch in pair_batches(conn, &pairs)?
-        .iter()
-        .take(opts.pairs.div_ceil(PAIR_BATCH))
-    {
+    // the budget counts pairs: per-domain batches can be smaller than PAIR_BATCH
+    let mut budget = opts.pairs;
+    for batch in pair_batches(&pairs) {
+        if budget == 0 {
+            break;
+        }
+        let batch = &batch[..batch.len().min(budget)];
+        budget -= batch.len();
         match judge_pairs(conn, llm, batch) {
             Ok(n) => {
                 r.pairs_queued += n;
@@ -358,7 +362,8 @@ fn expire(conn: &Connection) -> Result<usize> {
 
 /// Pairs in the same domain with cosine >= NEAR_DUP, not asked about before.
 /// Only items changed since `since` are probed (all of them on the first run).
-fn near_duplicates(conn: &Connection, since: Option<&str>) -> Result<Vec<(i64, i64, f32)>> {
+/// Near-duplicate pairs of live records within one domain, closest first, with the domain.
+fn near_duplicates(conn: &Connection, since: Option<&str>) -> Result<Vec<(String, Pair)>> {
     let probes = match since {
         Some(t) => {
             let mut stmt = conn.prepare(
@@ -391,53 +396,47 @@ fn near_duplicates(conn: &Connection, since: Option<&str>) -> Result<Vec<(i64, i
                 continue;
             }
             let pair = (id.min(other), id.max(other));
-            if !seen.insert(pair)
-                || review::pair_known(conn, pair.0, pair.1)?
-                || !same_domain_live(conn, pair)?
-            {
+            if !seen.insert(pair) || review::pair_known(conn, pair.0, pair.1)? {
                 continue;
             }
-            out.push((pair.0, pair.1, cos));
+            let Some(domain) = live_domain(conn, pair)? else {
+                continue;
+            };
+            out.push((domain, (pair.0, pair.1, cos)));
         }
     }
-    out.sort_by(|a, b| b.2.total_cmp(&a.2));
+    out.sort_by(|a, b| b.1.2.total_cmp(&a.1.2));
     Ok(out)
 }
 
-fn same_domain_live(conn: &Connection, (a, b): (i64, i64)) -> Result<bool> {
+/// The domain both records are in, if both are live and it is the same one.
+fn live_domain(conn: &Connection, (a, b): (i64, i64)) -> Result<Option<String>> {
     Ok(conn.query_row(
-        "SELECT count(DISTINCT s.domain) = 1 AND sum(i.status IN ('active', 'proposed')
+        "SELECT CASE WHEN count(DISTINCT s.domain) = 1 AND sum(i.status IN ('active', 'proposed')
                 AND NOT (i.space_id = 'global' AND i.status = 'proposed')) = 2
+                THEN min(s.domain) END
          FROM item i JOIN space s ON s.id = i.space_id WHERE i.id IN (?1, ?2)",
         params![a, b],
         |r| r.get(0),
     )?)
 }
 
+type Pair = (i64, i64, f32);
+
 /// Pairs batched for the model: one prompt never carries two domains' records (each
 /// pair is within one domain, but a batch of pairs need not be). Batches are ordered by
 /// their closest pair, so the most likely duplicates are judged first.
-fn pair_batches(conn: &Connection, pairs: &[(i64, i64, f32)]) -> Result<Vec<Vec<(i64, i64, f32)>>> {
-    let mut by_domain: Vec<(String, (i64, i64, f32))> = pairs
-        .iter()
-        .map(|&p| {
-            let domain: String = conn.query_row(
-                "SELECT s.domain FROM item i JOIN space s ON s.id = i.space_id WHERE i.id = ?1",
-                [p.0],
-                |r| r.get(0),
-            )?;
-            Ok((domain, p))
-        })
-        .collect::<Result<_>>()?;
+fn pair_batches(pairs: &[(String, Pair)]) -> Vec<Vec<Pair>> {
+    let mut by_domain = pairs.to_vec();
     // stable: within a domain the pairs keep their closest-first order
     by_domain.sort_by(|x, y| x.0.cmp(&y.0));
-    let mut batches: Vec<Vec<(i64, i64, f32)>> = by_domain
+    let mut batches: Vec<Vec<Pair>> = by_domain
         .chunk_by(|x, y| x.0 == y.0)
         .flat_map(|run| run.chunks(PAIR_BATCH))
         .map(|chunk| chunk.iter().map(|(_, p)| *p).collect())
         .collect();
     batches.sort_by(|x, y| y[0].2.total_cmp(&x[0].2));
-    Ok(batches)
+    batches
 }
 
 #[derive(Deserialize)]
@@ -448,7 +447,7 @@ struct PairVerdict {
     keep: Option<i64>,
 }
 
-fn judge_pairs(conn: &Connection, llm: &dyn Llm, pairs: &[(i64, i64, f32)]) -> Result<usize> {
+fn judge_pairs(conn: &Connection, llm: &dyn Llm, pairs: &[Pair]) -> Result<usize> {
     let mut prompt = String::from(
         "Each pair below is two memory items that look alike. For each pair decide:\n\
          - \"same\": they state the same thing; keep the clearer one\n\

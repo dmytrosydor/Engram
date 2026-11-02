@@ -1,6 +1,6 @@
 //! Writing items: hashing, titles, the change log.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -92,9 +92,15 @@ pub fn clip(s: &str, max: usize) -> String {
 /// scope, a session writing the same text would collide with another domain's hidden
 /// proposal and learn that it exists (and its id). Until it is accepted, a proposal
 /// only collides with proposals from its own domain; accepting it rehashes it under
-/// `global` ([`activate_global`]).
+/// `global` ([`activate`]).
 pub fn proposal_scope(domain: &str) -> String {
     format!("global@{domain}")
+}
+
+/// Hash scope for a global proposal written before proposals were scoped per domain:
+/// its writer's domain is unknown, so it collides with nothing.
+pub fn legacy_proposal_scope(id: i64) -> String {
+    format!("global#{id}")
 }
 
 pub fn insert_item(conn: &Connection, item: &NewItem, actor: &str) -> Result<Inserted> {
@@ -232,9 +238,10 @@ pub fn set_status(
     )
 }
 
-/// Makes a proposed record live under its space's normal hash scope. If the space
-/// already holds the same text, that record stays (restored if it was retired) and the
-/// proposal is deleted, since the unique hash cannot hold both. Returns the live id.
+/// Makes a record live under its space's normal hash scope (a proposal written to
+/// global is hashed per domain until now). The record keeps its own title, kind and
+/// dates: if a live record already holds the text, the proposal folds into it and that
+/// id is returned; if a retired one does, it stays retired and gives up the hash.
 pub fn activate(conn: &Connection, id: i64, actor: &str) -> Result<i64> {
     let before = item_json(conn, id)?;
     let space = before["space_id"].as_str().context("item without space")?;
@@ -247,40 +254,47 @@ pub fn activate(conn: &Connection, id: i64, actor: &str) -> Result<i64> {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    let Some((other, status)) = holder else {
-        conn.execute(
-            "UPDATE item SET content_hash = ?2 WHERE id = ?1",
-            params![id, hash],
-        )?;
-        set_status(conn, id, "active", None, actor)?;
-        return Ok(id);
-    };
-    conn.execute(
-        "UPDATE item SET superseded_by = ?2 WHERE superseded_by = ?1",
-        params![id, other],
-    )?;
-    conn.execute("DELETE FROM item_vec WHERE item_id = ?1", [id])?;
-    conn.execute("DELETE FROM item WHERE id = ?1", [id])?;
-    log(
-        conn,
-        actor,
-        "activate:existing",
-        Some(id),
-        Some(&before),
-        None,
-    )?;
-    if status != "active" {
-        conn.execute(
-            "UPDATE item SET superseded_by = NULL WHERE id = ?1",
-            [other],
-        )?;
-        conn.execute(
-            "DELETE FROM edge WHERE dst = ?1 AND type = 'supersedes'",
-            [other],
-        )?;
-        set_status(conn, other, "active", None, actor)?;
+    match holder {
+        Some((other, status)) if status == "active" => {
+            conn.execute(
+                "UPDATE item SET superseded_by = ?2 WHERE superseded_by = ?1",
+                params![id, other],
+            )?;
+            conn.execute("DELETE FROM item WHERE id = ?1", [id])?;
+            log(
+                conn,
+                actor,
+                "activate:existing",
+                Some(id),
+                Some(&before),
+                None,
+            )?;
+            return Ok(other);
+        }
+        // never turn on a record nobody reviewed (e.g. another domain's proposal)
+        Some((other, status)) if status == "proposed" => {
+            bail!("#{other} is another proposal with this text; decide that one first")
+        }
+        Some((other, _)) => {
+            let old = item_json(conn, other)?;
+            conn.execute("UPDATE item SET content_hash = NULL WHERE id = ?1", [other])?;
+            log(
+                conn,
+                actor,
+                "release-hash",
+                Some(other),
+                Some(&old),
+                Some(&item_json(conn, other)?),
+            )?;
+        }
+        None => {}
     }
-    Ok(other)
+    conn.execute(
+        "UPDATE item SET content_hash = ?2 WHERE id = ?1",
+        params![id, hash],
+    )?;
+    set_status(conn, id, "active", None, actor)?;
+    Ok(id)
 }
 
 pub fn set_pinned(conn: &Connection, id: i64, pinned: bool, actor: &str) -> Result<()> {

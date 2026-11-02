@@ -601,6 +601,9 @@ pub fn write(conn: &Connection, w: &Write, actor: &str) -> Result<Written> {
                 Written::Updated(id)
             }
         }
+    } else if let Some(live) = live_global_copy(&tx, hidden_global, body)? {
+        // every session already sees a live global record: naming it reveals nothing
+        Written::Exists(live)
     } else {
         let valid_until = expiry(&tx, w)?;
         let item = NewItem {
@@ -647,6 +650,20 @@ pub fn write(conn: &Connection, w: &Write, actor: &str) -> Result<Written> {
     };
     tx.commit()?;
     Ok(result)
+}
+
+/// A live global record holding `body`, for a session's global write.
+fn live_global_copy(conn: &Connection, hidden_global: bool, body: &str) -> Result<Option<i64>> {
+    if !hidden_global {
+        return Ok(None);
+    }
+    Ok(conn
+        .query_row(
+            "SELECT id FROM item WHERE content_hash = ?1 AND status = 'active'",
+            [store::content_hash("global", body)],
+            |r| r.get(0),
+        )
+        .optional()?)
 }
 
 /// The end date of a new or restored record. State written without one still
