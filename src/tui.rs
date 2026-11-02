@@ -627,6 +627,18 @@ impl App {
                 };
                 if row.status == "superseded" {
                     self.status = format!("#{id} was replaced by a newer record; it stays retired");
+                } else if to == "active" {
+                    // through activate: a global proposal archived before review must take
+                    // global's hash scope, or the same text could be live twice
+                    let tx = crate::db::write_tx(&self.conn)?;
+                    let live = store::activate(&tx, id, ACTOR)?;
+                    tx.commit()?;
+                    self.status = if live == id {
+                        format!("#{id} active")
+                    } else {
+                        format!("#{live} already holds this text; #{id} folded into it")
+                    };
+                    self.after_change()?;
                 } else {
                     store::set_status(&self.conn, id, to, None, ACTOR)?;
                     self.status = format!("#{id} {to}");

@@ -170,7 +170,8 @@ fn global_write_cannot_supersede() {
 }
 
 /// A session's global write of an archived global record's text neither rewrites
-/// that record nor lets a rejection delete it; accepting it brings the record back.
+/// that record nor lets a rejection delete it. Accepted, the proposal goes live with
+/// its own fields and the archived record stays retired.
 #[test]
 fn session_cannot_rewrite_retired_global_record() {
     let (_d, conn) = setup();
@@ -222,33 +223,55 @@ fn session_cannot_rewrite_retired_global_record() {
     review::reject(&conn, rid).unwrap();
     assert_eq!(status_of(&conn, g), "archived", "the old record survives");
 
-    // the same write accepted: the archived record comes back, the proposal folds in
     let Written::Created(p) = memory::write(
         &conn,
-        &w(
-            "global",
-            "again",
-            "Use tabs",
-            &personal,
-            "proposed",
-            Some("add"),
-        ),
+        &Write {
+            kind: "state",
+            valid_until: Some("2099-01-01"),
+            ..w(
+                "global",
+                "Fresh title",
+                "Use tabs",
+                &personal,
+                "proposed",
+                Some("add"),
+            )
+        },
         "p",
     )
     .unwrap() else {
         panic!()
     };
     let rid = review::add(&conn, "activate", &[p], &json!({}), "global write", "open").unwrap();
-    let msg = review::accept(&conn, rid, None, "cli").unwrap();
-    assert!(msg.contains(&format!("#{g}")), "{msg}");
-    assert_eq!(status_of(&conn, g), "active");
-    let left: i64 = conn
-        .query_row("SELECT count(*) FROM item WHERE id = ?1", [p], |r| r.get(0))
+    assert_eq!(
+        review::accept(&conn, rid, None, "cli").unwrap(),
+        format!("#{p} is active")
+    );
+    let (title, kind, until): (String, String, Option<String>) = conn
+        .query_row(
+            "SELECT title, kind, valid_until FROM item WHERE id = ?1",
+            [p],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
         .unwrap();
-    assert_eq!(left, 0);
+    assert_eq!(
+        (title.as_str(), kind.as_str(), until.as_deref()),
+        ("Fresh title", "state", Some("2099-01-01"))
+    );
+    assert_eq!(status_of(&conn, g), "archived", "no second live copy");
+    // the accepted record now holds global's hash
+    let cli = vec!["global".to_string()];
+    let again = memory::write(
+        &conn,
+        &w("global", "t", "Use tabs", &cli, "active", Some("add")),
+        "cli",
+    )
+    .unwrap();
+    assert!(matches!(again, Written::Exists(id) if id == p), "{again:?}");
 }
 
-/// An accepted proposal is rehashed under global, so later global duplicates are caught.
+/// An accepted proposal is rehashed under global; a session writing text that is
+/// already live in global is told so instead of opening another review.
 #[test]
 fn accepted_global_proposal_joins_global_hash_scope() {
     let (_d, conn) = setup();
@@ -274,23 +297,7 @@ fn accepted_global_proposal_joins_global_hash_scope() {
         review::accept(&conn, rid, None, "cli").unwrap(),
         format!("#{p} is active")
     );
-    let cli = vec!["global".to_string()];
     let r = memory::write(
-        &conn,
-        &w(
-            "global",
-            "t",
-            "Prefer UTC everywhere",
-            &cli,
-            "active",
-            Some("add"),
-        ),
-        "cli",
-    )
-    .unwrap();
-    assert!(matches!(r, Written::Exists(id) if id == p), "{r:?}");
-    // a new proposal of the now-active text folds into it on accept
-    let Written::Created(q) = memory::write(
         &conn,
         &w(
             "global",
@@ -302,11 +309,8 @@ fn accepted_global_proposal_joins_global_hash_scope() {
         ),
         "s",
     )
-    .unwrap() else {
-        panic!()
-    };
-    let rid = review::add(&conn, "activate", &[q], &json!({}), "global write", "open").unwrap();
-    review::accept(&conn, rid, None, "cli").unwrap();
+    .unwrap();
+    assert!(matches!(r, Written::Exists(id) if id == p), "{r:?}");
     let n: i64 = conn
         .query_row(
             "SELECT count(*) FROM item WHERE body = 'Prefer UTC everywhere'",
@@ -315,6 +319,201 @@ fn accepted_global_proposal_joins_global_hash_scope() {
         )
         .unwrap();
     assert_eq!(n, 1);
+}
+
+/// A proposal that went live elsewhere in the meantime folds into the live record.
+#[test]
+fn accepting_a_proposal_of_live_text_folds_it() {
+    let (_d, conn) = setup();
+    let work = vis(&conn, "work/acme");
+    let Written::Created(p) = memory::write(
+        &conn,
+        &w(
+            "global",
+            "t",
+            "Ship on Tuesdays",
+            &work,
+            "proposed",
+            Some("add"),
+        ),
+        "s",
+    )
+    .unwrap() else {
+        panic!()
+    };
+    let cli = vec!["global".to_string()];
+    let Written::Created(live) = memory::write(
+        &conn,
+        &w(
+            "global",
+            "t",
+            "Ship on Tuesdays",
+            &cli,
+            "active",
+            Some("add"),
+        ),
+        "cli",
+    )
+    .unwrap() else {
+        panic!()
+    };
+    let rid = review::add(&conn, "activate", &[p], &json!({}), "global write", "open").unwrap();
+    let msg = review::accept(&conn, rid, None, "cli").unwrap();
+    assert!(msg.starts_with(&format!("#{live} already held")), "{msg}");
+    let left: i64 = conn
+        .query_row("SELECT count(*) FROM item WHERE id = ?1", [p], |r| r.get(0))
+        .unwrap();
+    assert_eq!(left, 0);
+}
+
+/// Proposals written before per-domain scopes carried global's own hash. The v3
+/// migration moves them aside, so accepting another domain's proposal of the same
+/// text cannot switch on one nobody reviewed.
+#[test]
+fn legacy_global_proposals_are_migrated() {
+    let (d, conn) = setup();
+    let work = vis(&conn, "work/acme");
+    let personal = vis(&conn, "personal/side");
+    let Written::Created(old) = memory::write(
+        &conn,
+        &w(
+            "global",
+            "t",
+            "Rotate keys monthly",
+            &work,
+            "proposed",
+            Some("add"),
+        ),
+        "s",
+    )
+    .unwrap() else {
+        panic!()
+    };
+    // as 0.1.2 stored it
+    conn.execute(
+        "UPDATE item SET content_hash = ?2 WHERE id = ?1",
+        rusqlite::params![old, store::content_hash("global", "Rotate keys monthly")],
+    )
+    .unwrap();
+    conn.pragma_update(None, "user_version", 2).unwrap();
+    drop(conn);
+    let path = d.path().join("engram.db");
+    db::init(&path).unwrap();
+    let conn = db::connect(&path).unwrap();
+
+    let Written::Created(new) = memory::write(
+        &conn,
+        &w(
+            "global",
+            "t",
+            "Rotate keys monthly",
+            &personal,
+            "proposed",
+            Some("add"),
+        ),
+        "s",
+    )
+    .unwrap() else {
+        panic!()
+    };
+    let rid = review::add(
+        &conn,
+        "activate",
+        &[new],
+        &json!({}),
+        "global write",
+        "open",
+    )
+    .unwrap();
+    assert_eq!(
+        review::accept(&conn, rid, None, "cli").unwrap(),
+        format!("#{new} is active")
+    );
+    assert_eq!(
+        status_of(&conn, old),
+        "proposed",
+        "still waiting for review"
+    );
+    // and when it is accepted later, it folds into the live copy
+    let rid = review::add(
+        &conn,
+        "activate",
+        &[old],
+        &json!({}),
+        "global write",
+        "open",
+    )
+    .unwrap();
+    review::accept(&conn, rid, None, "cli").unwrap();
+    let n: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM item WHERE body = 'Rotate keys monthly'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 1);
+}
+
+/// `activate` refuses to switch on another unreviewed record that holds the text.
+#[test]
+fn activate_never_turns_on_another_proposal() {
+    let (_d, conn) = setup();
+    let work = vis(&conn, "work/acme");
+    let personal = vis(&conn, "personal/side");
+    let ids: Vec<i64> = [&work, &personal]
+        .iter()
+        .map(|v| {
+            match memory::write(
+                &conn,
+                &w("global", "t", "Same text", v, "proposed", Some("add")),
+                "s",
+            )
+            .unwrap()
+            {
+                Written::Created(id) => id,
+                other => panic!("{other:?}"),
+            }
+        })
+        .collect();
+    // force a collision the way a pre-v3 database could have one
+    conn.execute(
+        "UPDATE item SET content_hash = ?2 WHERE id = ?1",
+        rusqlite::params![ids[0], store::content_hash("global", "Same text")],
+    )
+    .unwrap();
+    let tx = db::write_tx(&conn).unwrap();
+    assert!(store::activate(&tx, ids[1], "cli").is_err());
+    drop(tx);
+    assert_eq!(status_of(&conn, ids[0]), "proposed");
+}
+
+/// The TUI restores an archived record through `activate`: an archived hidden proposal
+/// must come back under global's hash, so the same text is never live twice.
+#[test]
+fn restoring_an_archived_proposal_uses_global_hash() {
+    let (_d, conn) = setup();
+    let work = vis(&conn, "work/acme");
+    let Written::Created(p) = memory::write(
+        &conn,
+        &w("global", "t", "Use rebase", &work, "proposed", Some("add")),
+        "s",
+    )
+    .unwrap() else {
+        panic!()
+    };
+    store::set_status(&conn, p, "archived", None, "tui").unwrap();
+    let tx = db::write_tx(&conn).unwrap();
+    assert_eq!(store::activate(&tx, p, "tui").unwrap(), p);
+    tx.commit().unwrap();
+    let cli = vec!["global".to_string()];
+    let r = memory::write(
+        &conn,
+        &w("global", "t", "Use rebase", &cli, "active", Some("add")),
+        "cli",
+    )
+    .unwrap();
+    assert!(matches!(r, Written::Exists(id) if id == p), "{r:?}");
 }
 
 struct Rec(RefCell<Vec<String>>);
@@ -371,6 +570,44 @@ fn daily_pairs_are_batched_per_domain() {
             "one prompt carries two domains:\n{p}"
         );
     }
+}
+
+/// The --pairs budget counts pairs, not batches: with one pair per domain, a budget of
+/// two judges both.
+#[test]
+fn daily_pair_budget_counts_pairs() {
+    unsafe {
+        std::env::set_var("ENGRAM_EMBED_SOCK", "/nonexistent/engram-test.sock");
+        std::env::set_var("ENGRAM_LLAMA_SERVER", "/usr/bin/false");
+    }
+    let (d, conn) = setup();
+    let put = |space: &str, title: &str, v: usize| {
+        let vis = vec![space.to_string()];
+        memory::write(
+            &conn,
+            &Write {
+                vector: Some(&axis(v)),
+                ..w(space, title, title, &vis, "active", Some("add"))
+            },
+            "t",
+        )
+        .unwrap();
+    };
+    put("work/acme", "W one", 3);
+    put("work/acme", "W two", 3);
+    put("personal/side", "P one", 5);
+    put("personal/side", "P two", 5);
+    let llm = Rec(RefCell::new(vec![]));
+    let opts = Options {
+        classify: 0,
+        transcripts: 0,
+        pairs: 2,
+        projects: d.path().join("p"),
+        inbox_dir: d.path().join("i"),
+        exclude: vec![],
+    };
+    daily::run(&conn, &llm, &opts, |_| {}).unwrap();
+    assert_eq!(llm.0.borrow().len(), 2);
 }
 
 #[test]
